@@ -124,6 +124,7 @@ FFMPEG_WATCH_INTERVAL = timedelta(seconds=5)
 FFMPEG_LOGGER = "ffmpeg_logger"
 FFMPEG_WATCHER = "ffmpeg_watcher"
 FFMPEG_PID = "ffmpeg_pid"
+FFMPEG_DIAGNOSTICS = "ffmpeg_diagnostics"
 AUDIO_PROXY = "audio_proxy"
 SESSION_ID = "session_id"
 
@@ -266,6 +267,7 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                         ),
                         self._hksv_stop_live,
                         self._hksv_sync_characteristics,
+                        self._hksv_stop_live,
                         camera_entity_id=self.entity_id,
                     )
                 except Exception:
@@ -320,9 +322,11 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         char.set_value(value)
 
     @callback
-    def _hksv_stop_live(self) -> None:
-        """Stop existing live streams when the HomeKit camera is disabled."""
+    def _hksv_stop_live(self, stream_idx: int | None = None) -> None:
+        """Stop one disabled stream slot or every stream if the camera is off."""
         for session_info in list(self.sessions.values()):
+            if stream_idx is not None and session_info.get("stream_idx") != stream_idx:
+                continue
             self.hass.async_create_background_task(
                 self.stop_stream(session_info), "homekit.camera-stop-stream"
             )
@@ -442,11 +446,7 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             or not self._hksv.stream_active(session_info["stream_idx"])
         ):
             raise RuntimeError("HomeKit camera stream is disabled")
-        _LOGGER.debug(
-            "[%s] Starting stream with the following parameters: %s",
-            session_info["id"],
-            stream_config,
-        )
+        _LOGGER.debug("[%s] Starting HomeKit live stream", session_info["id"])
         if not (input_source := await self._async_get_stream_source()):
             _LOGGER.error("Camera has no stream source")
             return False
@@ -509,7 +509,6 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         output = VIDEO_OUTPUT.format(**output_vars)
         if self.config[CONF_SUPPORT_AUDIO]:
             output = output + " " + AUDIO_OUTPUT.format(**output_vars)
-        _LOGGER.debug("FFmpeg output settings: %s", output)
         stream = HAFFmpeg(self._ffmpeg.binary)
         opened = await stream.open(
             cmd=[],
@@ -541,7 +540,7 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             await self._async_ffmpeg_watch(session_info["id"])
 
         session_info[FFMPEG_LOGGER] = create_eager_task(
-            self._async_log_stderr_stream(stderr_reader)
+            self._async_log_stderr_stream(stderr_reader, session_info)
         )
         session_info[FFMPEG_WATCHER] = async_track_time_interval(
             self.hass,
@@ -552,26 +551,78 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         return await self._async_ffmpeg_watch(session_info["id"])
 
     async def _async_log_stderr_stream(
-        self, stderr_reader: asyncio.StreamReader
+        self, stderr_reader: asyncio.StreamReader, session_info: dict[str, Any]
     ) -> None:
-        """Log output from ffmpeg."""
-        _LOGGER.debug("%s: ffmpeg: started", self.display_name)
-        while True:
-            line = await stderr_reader.readline()
-            if line == b"":
-                return
-
-            _LOGGER.debug("%s: ffmpeg: %s", self.display_name, line.rstrip())
+        """Keep only bounded, non-sensitive FFmpeg error categories."""
+        categories: set[str] = set()
+        session_info[FFMPEG_DIAGNOSTICS] = categories
+        patterns = (
+            ("authentication", (b"401 unauthorized", b"unauthorized")),
+            ("input_not_found", (b"404 not found", b"server returned 404")),
+            ("connection_refused", (b"connection refused",)),
+            ("timeout", (b"timed out", b"connection timeout")),
+            (
+                "resource_busy",
+                (b"resource temporarily unavailable", b"server returned 453"),
+            ),
+            (
+                "invalid_input",
+                (b"invalid data found", b"could not find codec parameters"),
+            ),
+            (
+                "encoder",
+                (
+                    b"error initializing output stream",
+                    b"error while opening encoder",
+                    b"failed to configure output pad",
+                ),
+            ),
+            (
+                "address_or_protocol",
+                (
+                    b"address family not supported",
+                    b"invalid ipv6",
+                    b"invalid argument",
+                    b"protocol not found",
+                ),
+            ),
+            (
+                "network_io",
+                (b"input/output error", b"connection reset by peer", b"broken pipe"),
+            ),
+        )
+        tail = b""
+        while chunk := await stderr_reader.read(4096):
+            scan = (tail + chunk).lower()
+            for category, terms in patterns:
+                if any(term in scan for term in terms):
+                    categories.add(category)
+            tail = scan[-128:]
 
     async def _async_ffmpeg_watch(self, session_id: str) -> bool:
         """Check to make sure ffmpeg is still running and cleanup if not."""
-        ffmpeg_pid = self.sessions[session_id][FFMPEG_PID]
+        session_info = self.sessions[session_id]
+        ffmpeg_pid = session_info[FFMPEG_PID]
         if pid_is_alive(ffmpeg_pid):
             return True
-
-        _LOGGER.warning("Streaming process ended unexpectedly - PID %d", ffmpeg_pid)
+        logger_task = session_info.get(FFMPEG_LOGGER)
+        if logger_task is not None:
+            try:
+                async with asyncio.timeout(0.5):
+                    await asyncio.shield(logger_task)
+            except TimeoutError:
+                pass
+        diagnostics = sorted(session_info.get(FFMPEG_DIAGNOSTICS, ()))
+        stream = session_info.get("stream")
+        exit_code = stream.process.returncode if stream is not None else None
+        _LOGGER.warning(
+            "%s: HomeKit live stream ended unexpectedly (exit=%s, categories=%s)",
+            self.entity_id,
+            exit_code,
+            diagnostics or ["unclassified"],
+        )
         self._async_stop_ffmpeg_watch(session_id)
-        self.set_streaming_available(self.sessions[session_id]["stream_idx"])
+        self.set_streaming_available(session_info["stream_idx"])
         return False
 
     @callback

@@ -17,7 +17,7 @@ from homeassistant.components.homekit.const import (
     CONF_STREAM_SOURCE,
     SERV_MOTION_SENSOR,
 )
-from homeassistant.components.homekit.type_cameras import Camera
+from homeassistant.components.homekit.type_cameras import FFMPEG_PID, Camera
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
@@ -73,6 +73,15 @@ async def test_camera_motion_missing_at_start(hass: HomeAssistant, run_driver) -
         await accessory.start_stream({"id": "disabled", "stream_idx": 0}, {})
     first.client_update_value(1, session=session)
     assert accessory._hksv.stream_active(0)
+    slot_zero = {"id": "slot_zero", "stream_idx": 0}
+    slot_one = {"id": "slot_one", "stream_idx": 1}
+    accessory.sessions.update({"slot_zero": slot_zero, "slot_one": slot_one})
+    with patch.object(accessory, "stop_stream", new_callable=AsyncMock) as stop_stream:
+        first.client_update_value(0, session=session)
+        await hass.async_block_till_done()
+        stop_stream.assert_awaited_once_with(slot_zero)
+    first.client_update_value(1, session=session)
+    accessory.sessions.clear()
     session_info = {"id": "existing"}
     accessory.sessions["existing"] = session_info
     session = HAPSession(uuid4(), b"x" * 32)
@@ -194,3 +203,39 @@ async def test_explicit_stream_source_disables_hksv_only(
     assert accessory._management
     assert await accessory._async_get_stream_source() == source
     assert "Secure Video is unavailable with an explicit stream source" in caplog.text
+
+
+async def test_live_failure_reports_only_safe_categories(
+    hass: HomeAssistant, run_driver, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Retain bounded failure categories without logging URLs or SRTP secrets."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.demo_camera", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.demo_camera", 2, {})
+    session = {
+        "id": "diagnostic",
+        "stream_idx": 0,
+        FFMPEG_PID: 999999,
+        "stream": SimpleNamespace(process=SimpleNamespace(returncode=1)),
+    }
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"x" * 4090
+        + b"Connection refused rtsp://user:secret@host/stream srtp-key-secret"
+    )
+    reader.feed_eof()
+    await accessory._async_log_stderr_stream(reader, session)
+    assert session["ffmpeg_diagnostics"] == {"connection_refused"}
+    accessory.sessions["diagnostic"] = session
+    with (
+        patch(
+            "homeassistant.components.homekit.type_cameras.pid_is_alive",
+            return_value=False,
+        ),
+        patch.object(accessory, "set_streaming_available"),
+    ):
+        assert not await accessory._async_ffmpeg_watch("diagnostic")
+    assert "connection_refused" in caplog.text
+    assert "secret" not in caplog.text
+    assert "rtsp://" not in caplog.text
+    accessory.sessions.clear()

@@ -41,6 +41,7 @@ class HKSVController:
         store: Any,
         on_camera_disabled: Callable[[], None] | None = None,
         on_state_loaded: Callable[[], None] | None = None,
+        on_stream_disabled: Callable[[int], None] | None = None,
         *,
         camera_entity_id: str = "camera",
     ) -> None:
@@ -51,6 +52,7 @@ class HKSVController:
         self.store = store
         self.on_camera_disabled = on_camera_disabled
         self.on_state_loaded = on_state_loaded
+        self.on_stream_disabled = on_stream_disabled
         self._stream_active_values: dict[int, bool] = {}
         self._ready = False
         self._privacy_ready = False
@@ -195,8 +197,8 @@ class HKSVController:
         self._stream_active_values[index] = bool(value)
         if self.on_state_loaded:
             self.on_state_loaded()
-        if not value and self.on_camera_disabled:
-            self.on_camera_disabled()
+        if not value and self.on_stream_disabled:
+            self.on_stream_disabled(index)
         self._schedule_save()
 
     @property

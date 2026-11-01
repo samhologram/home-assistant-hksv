@@ -130,11 +130,12 @@ async def _async_stop_stream(
 def _mock_reader():
     """Mock ffmpeg reader."""
 
-    async def _readline(*args, **kwargs):
+    async def _read(*args, **kwargs):
         await asyncio.sleep(0.1)
+        return b""
 
     async def _get_reader(*args, **kwargs):
-        return AsyncMock(readline=_readline)
+        return AsyncMock(read=_read)
 
     return _get_reader
 

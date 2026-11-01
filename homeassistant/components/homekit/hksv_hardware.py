@@ -120,7 +120,8 @@ class HardwareEncoderProbe:
             result = None
             generation = self._generation
             skipped = False
-            for candidate in _candidates(profile_name, level_name):
+            candidates = await asyncio.to_thread(_candidates, profile_name, level_name)
+            for candidate in candidates:
                 if self._disabled_until.get(candidate.codec, 0) > time.monotonic():
                     skipped = True
                     continue
