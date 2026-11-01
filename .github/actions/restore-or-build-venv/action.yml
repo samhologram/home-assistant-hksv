@@ -90,18 +90,32 @@ runs:
           libudev-dev
         version: ${{ inputs.apt-cache-version }}
         execute_install_scripts: true
+    - name: Check out pinned HAP fork for HKSV
+      if: steps.cache-venv.outputs.cache-hit != 'true' && github.repository == 'samhologram/home-assistant-hksv'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: samhologram/HAP-python-hksv
+        ref: e6bd1a45c10f2b6710d3e0fa2e8b5e27b5ddd6c6
+        path: .hksv-deps/HAP-python
+        persist-credentials: false
     - name: Create Python virtual environment
       if: steps.cache-venv.outputs.cache-hit != 'true'
       id: create-venv
       shell: bash
       env:
         PYTHON_VERSION: ${{ steps.python.outputs.python-version }}
+        REPOSITORY: ${{ github.repository }}
       run: |
         uv venv venv --python "${PYTHON_VERSION}"
         . venv/bin/activate
         python --version
         uv pip install -r requirements.txt
-        uv pip install -r requirements_all.txt -r requirements_test.txt
+        if [ "$REPOSITORY" = "samhologram/home-assistant-hksv" ]; then
+          uv build --wheel --out-dir /tmp/hksv-ci-wheel .hksv-deps/HAP-python
+          uv pip install --find-links /tmp/hksv-ci-wheel -r requirements_all.txt -r requirements_test.txt
+        else
+          uv pip install -r requirements_all.txt -r requirements_test.txt
+        fi
         uv pip install -e . --config-settings editable_mode=compat
     - name: Prune uv cache
       if: inputs.save == 'true' && steps.cache-venv.outputs.cache-hit != 'true'

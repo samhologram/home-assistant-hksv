@@ -433,6 +433,9 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 self._hksv.motion(True)
                 self._hksv.motion(False)
             char.set_value(True)
+            if self._hksv is None:
+                char.set_value(False)
+                return
             if previous := getattr(self, "_motion_event_reset", None):
                 previous.cancel()
             self._motion_event_reset = self.hass.loop.call_later(

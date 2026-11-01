@@ -58,7 +58,7 @@ jobs:
               python3 -c "from pathlib import Path; import re; lines = Path(\"requirements_test.txt\").read_text().splitlines(); Path(\"requirements-hksv-test-filtered.txt\").write_text(\"\\n\".join(line for line in lines if not line.startswith(\"-r \") and not re.match(r\"(?i)^(ast-serialize|librt|mypy|prek|pipdeptree|types-[^= ]+)==\", line)) + \"\\n\")"
               uv pip install --system --index-strategy unsafe-best-match -r requirements-hksv-test-filtered.txt ruff==0.16.9
               python3 -c "from importlib.metadata import version; assert version(\"HAP-python\") == \"5.0.0.post1\""
-              python3 -m script.translations develop --integration homekit
+              python3 -m script.translations develop --all
               ruff check homeassistant/components/homekit homeassistant/components/stream tests/components/homekit tests/components/stream
               ruff format --check homeassistant/components/homekit homeassistant/components/stream tests/components/homekit tests/components/stream
               pylint --ignore-missing-annotations=y homeassistant/components/homekit/hksv_*.py homeassistant/components/homekit/type_cameras.py homeassistant/components/stream/__init__.py homeassistant/components/stream/core.py homeassistant/components/stream/worker.py
