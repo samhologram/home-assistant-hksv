@@ -10,9 +10,11 @@ import pytest
 
 from homeassistant.components.homekit import hksv_controller
 from homeassistant.components.homekit.hksv_config import RecordingConfiguration
+from homeassistant.components.homekit.hksv_hardware import HardwareEncoder
 from homeassistant.components.homekit.hksv_media import (
     FragmentBuffer,
     RecordingProcess,
+    can_copy_audio,
     can_copy_video,
     ffmpeg_command,
     read_box,
@@ -22,6 +24,7 @@ from homeassistant.components.homekit.hksv_media import (
 from homeassistant.components.homekit.hksv_stream import (
     MediaObservation,
     SharedFragment,
+    inspect_recording,
 )
 
 
@@ -366,10 +369,10 @@ async def test_monitored_copy_stops_before_invalid_fragment(
         return None
 
     controller = hksv_controller.HKSVController(source, "ffmpeg", None)
-    assert [f.data async for f in controller._monitored_copy(Shared(), config)] == [
-        b"one"
-    ]
-    assert controller._copy_disabled
+    assert [
+        f.data async for f in controller._monitored_copy(Shared(), config, True, False)
+    ] == [b"one"]
+    assert controller._video_copy_disabled
 
 
 async def test_native_probe_adds_supported_resolution(
@@ -417,3 +420,203 @@ async def test_native_probe_adds_supported_resolution(
     assert (1280, 960, 30) in controller.capabilities.resolutions
     assert (1920, 1080, 30) in controller.capabilities.resolutions
     assert shared.closed
+
+
+def test_audio_copy_checks_configuration_independently() -> None:
+    """AAC may be copied even if the video format requires encoding."""
+    observed = MediaObservation(
+        "hevc",
+        0,
+        0,
+        320,
+        240,
+        "aac",
+        "LC",
+        24000,
+        1,
+        15,
+        1,
+        15,
+        400_000,
+        300_000,
+        4,
+        33584,
+        2,
+        2024,
+        True,
+    )
+    config = RecordingConfiguration(
+        4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
+    )
+    assert can_copy_audio(observed, config)
+    assert not can_copy_video(observed, config)
+    assert not can_copy_audio(replace(observed, audio_object_type=5), config)
+    assert not can_copy_audio(replace(observed, audio_rate=16000), config)
+    assert not can_copy_audio(replace(observed, audio_peak_bitrate=36025), config)
+
+
+@pytest.mark.parametrize(
+    ("copy_video", "copy_audio"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_independent_track_commands(copy_video: bool, copy_audio: bool) -> None:
+    """Select video and audio codecs independently."""
+    config = RecordingConfiguration(
+        4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
+    )
+    command = ffmpeg_command(
+        "ffmpeg",
+        ["-i", "pipe:0"],
+        config,
+        True,
+        copy_video=copy_video,
+        copy_audio=copy_audio,
+    )
+    assert command[command.index("-c:v") + 1] == ("copy" if copy_video else "libx264")
+    assert command[command.index("-c:a") + 1] == ("copy" if copy_audio else "aac")
+
+
+async def test_aac_copy_probe_with_real_ffmpeg() -> None:
+    """Recognize 24 kHz AAC-LC despite whole-frame one-second jitter."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("FFmpeg is not installed")
+    producer = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=15[out0];sine=frequency=1000:sample_rate=24000[out1]",
+        "-t",
+        "8",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "30",
+        "-c:a",
+        "aac",
+        "-ac",
+        "1",
+        "-ar",
+        "24000",
+        "-b:a",
+        "32k",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    assert producer.stdout is not None
+    buffer = FragmentBuffer(30, 10_000_000)
+    try:
+        await asyncio.wait_for(read_fragments(producer.stdout, buffer), 20)
+        assert await producer.wait() == 0
+        init, fragments = buffer.snapshot()
+        observed = await asyncio.to_thread(inspect_recording, init, fragments)
+        config = RecordingConfiguration(
+            4000, 1, 4000, 0, 2, 1000, 4000, 320, 240, 15, 0, 1, 0, 2, 32
+        )
+        assert observed.audio_object_type == 2
+        assert can_copy_audio(observed, config)
+
+        async def source() -> AsyncIterator[bytes]:
+            yield init
+            for fragment in fragments:
+                yield fragment
+
+        command = ffmpeg_command(
+            ffmpeg, ["-i", "pipe:0"], config, True, copy_audio=True
+        )
+        recording = RecordingProcess(command, 30, 10_000_000)
+        await recording.start(source())
+        try:
+            output = [item async for item in recording.fragments()]
+            assert len(output) >= 2
+            assert b"mp4a" in output[0]
+        finally:
+            await recording.stop()
+    finally:
+        if producer.returncode is None:
+            producer.kill()
+            await producer.wait()
+
+
+def test_hardware_command_and_software_fallback() -> None:
+    """Put probed hardware arguments in the right FFmpeg positions."""
+    config = RecordingConfiguration(
+        4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
+    )
+    hardware = HardwareEncoder(
+        "h264_vaapi",
+        ("-vaapi_device", "/dev/dri/renderD128"),
+        "format=nv12,hwupload",
+        ("-profile:v", "baseline", "-level:v", "4.0"),
+    )
+    command = ffmpeg_command(
+        "ffmpeg", ["-i", "pipe:0"], config, False, hardware=hardware
+    )
+    assert command.index("-vaapi_device") < command.index("-i")
+    assert command[command.index("-c:v") + 1] == "h264_vaapi"
+    assert command[command.index("-vf") + 1] == "scale=320:240,format=nv12,hwupload"
+    fallback = ffmpeg_command("ffmpeg", ["-i", "pipe:0"], config, False)
+    assert fallback[fallback.index("-c:v") + 1] == "libx264"
+
+
+async def test_audio_violation_does_not_disable_video_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the incompatible copied track falls back to encoding."""
+    good = MediaObservation(
+        "h264",
+        66,
+        31,
+        320,
+        240,
+        "aac",
+        "LC",
+        24000,
+        1,
+        15,
+        1,
+        15,
+        400_000,
+        300_000,
+        4,
+        33_000,
+        2,
+        2000,
+        True,
+    )
+    observations = iter((good, replace(good, audio_rate=16000)))
+    monkeypatch.setattr(
+        hksv_controller, "inspect_recording", lambda *_: next(observations)
+    )
+    config = RecordingConfiguration(
+        4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
+    )
+
+    class Shared:
+        async def fragments(self) -> AsyncIterator[SharedFragment]:
+            yield SharedFragment(1, 1, b"init", b"one", 4)
+            yield SharedFragment(1, 2, b"init", b"two", 4)
+            yield SharedFragment(1, 3, b"init", b"three", 4)
+
+    async def source(_with_audio: bool) -> None:
+        return None
+
+    controller = hksv_controller.HKSVController(source, "ffmpeg", None)
+    assert [
+        fragment.data
+        async for fragment in controller._monitored_copy(Shared(), config, True, True)
+    ] == [b"one"]
+    assert controller._audio_copy_disabled
+    assert not controller._video_copy_disabled

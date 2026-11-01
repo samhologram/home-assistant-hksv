@@ -266,6 +266,7 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                         ),
                         self._hksv_stop_live,
                         self._hksv_sync_characteristics,
+                        camera_entity_id=self.entity_id,
                     )
                 except Exception:
                     _LOGGER.exception(

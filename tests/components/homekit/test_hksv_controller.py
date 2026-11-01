@@ -2,13 +2,16 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from pyhap.hap_session import HAPSession
 import pyhap.secure_video as s
+import pytest
 
 from homeassistant.components.homekit import hksv_controller as c
+from homeassistant.components.homekit.hksv_config import RecordingConfiguration
+from homeassistant.components.homekit.hksv_hardware import HardwareEncoder
 
 
 class Store:
@@ -218,9 +221,14 @@ def test_shared_source_attached_and_detached() -> None:
         ctl = c.HKSVController(source, "ffmpeg", Store())
         ctl.hds = HDS()
         ctl.active = True
-        ctl.configuration = SimpleNamespace(prebuffer_ms=4000)
+        ctl.configuration = SimpleNamespace(
+            prebuffer_ms=4000, profile=0, level=2, width=320, height=240, fps=15
+        )
         with (
             patch.object(c, "RecordingProcess", Process),
+            patch.object(
+                c._HARDWARE_PROBE, "select", new_callable=AsyncMock, return_value=None
+            ),
             patch.object(
                 c, "ffmpeg_command", return_value=["ffmpeg", "-i", "pipe:0"]
             ) as command,
@@ -233,3 +241,119 @@ def test_shared_source_attached_and_detached() -> None:
             assert proc.stopped and shared.closed
 
     asyncio.run(run())
+
+
+async def test_hardware_failure_switches_to_software(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quarantine a failed device and schedule a software restart."""
+
+    async def source(_with_audio: bool):
+        return None
+
+    class FailedProcess:
+        returncode = 1
+        stopped = False
+
+        async def wait(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class Probe:
+        failed = None
+
+        def report_failure(self, codec: str) -> None:
+            self.failed = codec
+
+    probe = Probe()
+    monkeypatch.setattr(c, "_HARDWARE_PROBE", probe)
+    controller = c.HKSVController(source, "ffmpeg", Store())
+    process = FailedProcess()
+    controller._process = process
+    controller._active_hardware = HardwareEncoder("h264_vaapi", (), "", ())
+    restarts = []
+    controller._schedule_reconcile = lambda: restarts.append(True)
+    monkeypatch.setattr(c.asyncio, "sleep", AsyncMock())
+    await controller._monitor(process)
+    assert process.stopped
+    assert probe.failed == "h264_vaapi"
+    assert controller._force_software
+    assert restarts == [True]
+
+
+async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed hardware process restarts recording with software encoding."""
+    started_software = asyncio.Event()
+    hardware = HardwareEncoder("h264_vaapi", (), "", ())
+    reports: list[str] = []
+    commands: list[HardwareEncoder | None] = []
+
+    class Probe:
+        async def select(self, *_args):
+            return hardware
+
+        def report_failure(self, codec: str) -> None:
+            reports.append(codec)
+
+    class Shared:
+        async def fragments(self):
+            yield object()
+
+        async def close(self) -> None:
+            return None
+
+    async def source(_with_audio: bool):
+        return Shared()
+
+    def command(*_args, hardware=None, **_kwargs):
+        commands.append(hardware)
+        return [hardware.codec if hardware else "libx264"]
+
+    class Process:
+        running = True
+
+        def __init__(self, args, _seconds, _limit) -> None:
+            self.is_hardware = args[0] != "libx264"
+            self.returncode = 1 if self.is_hardware else None
+            self.input_data = None
+
+        async def start(self, input_data) -> None:
+            self.input_data = input_data
+            if not self.is_hardware:
+                started_software.set()
+
+        async def wait(self) -> None:
+            if not self.is_hardware:
+                await asyncio.Event().wait()
+
+        async def stop(self) -> None:
+            assert self.input_data is not None
+            await self.input_data.aclose()
+
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(c, "_HARDWARE_PROBE", Probe())
+    monkeypatch.setattr(c, "RecordingProcess", Process)
+    monkeypatch.setattr(c, "ffmpeg_command", command)
+    monkeypatch.setattr(c.asyncio, "sleep", fast_sleep)
+    controller = c.HKSVController(source, "ffmpeg", Store())
+    controller.hds = HDS()
+    controller.active = True
+    controller.configuration = RecordingConfiguration(
+        4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
+    )
+    try:
+        await controller._reconcile()
+        await asyncio.wait_for(started_software.wait(), 2)
+        assert commands == [hardware, None]
+        assert reports == ["h264_vaapi"]
+        assert controller._process is not None
+    finally:
+        await controller.close()

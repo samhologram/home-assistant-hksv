@@ -211,6 +211,10 @@ class MediaObservation:
     peak_video_bitrate: int
     average_video_bitrate: float
     observation_seconds: float
+    audio_peak_bitrate: int = 0
+    audio_object_type: int = 0
+    audio_max_packet_bits: int = 0
+    audio_continuous: bool = False
 
 
 def inspect_recording(
@@ -239,23 +243,42 @@ def inspect_recording(
         video = videos[0]
         codec = video.codec_context
         extra = codec.extradata or b""
-        if codec.name != "h264" or len(extra) < 4 or extra[0] != 1:
-            raise ValueError("Expected H.264 avcC configuration")
+        is_h264 = codec.name == "h264" and len(extra) >= 4 and extra[0] == 1
         if not codec.width or not codec.height:
             raise ValueError("Video dimensions unavailable")
         audio = audios[0].codec_context if audios else None
-        if audio is not None and (audio.name != "aac" or not audio.extradata):
-            raise ValueError("Expected AAC with decoder configuration")
+        audio_extra = audio.extradata or b"" if audio else b""
+        audio_object_type = audio_extra[0] >> 3 if audio_extra else 0
         first = last = previous = None
         keyframes: list[float] = []
         video_bytes = 0
         video_packets = 0
         window: deque[tuple[float, int]] = deque()
         window_bytes = peak_bytes = peak_frames = 0
-        for packet in container.demux(video):
+        audio_window: deque[tuple[float, int]] = deque()
+        audio_window_bytes = audio_peak_bytes = audio_max_packet_bytes = 0
+        audio_first = audio_last = None
+        audio_valid = True
+        streams = (video, audios[0]) if audios else (video,)
+        for packet in container.demux(*streams):
             if packet.dts is None or packet.time_base is None:
                 continue
             timestamp = float(packet.dts * packet.time_base)
+            if audios and packet.stream.index == audios[0].index:
+                if audio_last is not None and (
+                    timestamp <= audio_last or timestamp - audio_last > 0.2
+                ):
+                    audio_valid = False
+                if audio_first is None:
+                    audio_first = timestamp
+                audio_last = timestamp
+                audio_window.append((timestamp, packet.size))
+                audio_window_bytes += packet.size
+                audio_max_packet_bytes = max(audio_max_packet_bytes, packet.size)
+                while audio_window and audio_window[0][0] <= timestamp - 1 + 1e-6:
+                    audio_window_bytes -= audio_window.popleft()[1]
+                audio_peak_bytes = max(audio_peak_bytes, audio_window_bytes)
+                continue
             if previous is not None and timestamp <= previous:
                 raise ValueError("Nonmonotonic video timestamps")
             previous = last = timestamp
@@ -276,8 +299,8 @@ def inspect_recording(
         duration = last - first
         return MediaObservation(
             codec.name,
-            extra[1],
-            extra[3],
+            extra[1] if is_h264 else 0,
+            extra[3] if is_h264 else 0,
             codec.width,
             codec.height,
             audio.name if audio else None,
@@ -290,4 +313,13 @@ def inspect_recording(
             peak_bytes * 8,
             video_bytes * 8 / duration,
             duration,
+            audio_peak_bytes * 8,
+            audio_object_type,
+            audio_max_packet_bytes * 8,
+            bool(
+                audio_valid
+                and audio_first is not None
+                and audio_last is not None
+                and audio_last - audio_first >= duration - 0.25
+            ),
         )

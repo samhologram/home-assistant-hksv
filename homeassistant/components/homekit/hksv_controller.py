@@ -17,8 +17,10 @@ from pyhap.secure_video import HKSVServices, RecordingCapabilities, b64, parse_s
 from homeassistant.exceptions import HomeAssistantError
 
 from .hksv_config import RecordingConfiguration
+from .hksv_hardware import HardwareEncoder, HardwareEncoderProbe
 from .hksv_media import (
     RecordingProcess,
+    can_copy_audio,
     can_copy_video,
     ffmpeg_command,
     shared_mp4_input,
@@ -26,6 +28,7 @@ from .hksv_media import (
 from .hksv_stream import SharedCameraStream, SharedFragment, inspect_recording
 
 _LOGGER = logging.getLogger(__name__)
+_HARDWARE_PROBE = HardwareEncoderProbe()
 
 
 class HKSVController:
@@ -38,9 +41,12 @@ class HKSVController:
         store: Any,
         on_camera_disabled: Callable[[], None] | None = None,
         on_state_loaded: Callable[[], None] | None = None,
+        *,
+        camera_entity_id: str = "camera",
     ) -> None:
         """Initialize detached services and the recording lifecycle."""
         self.source = source
+        self.camera_entity_id = camera_entity_id
         self.ffmpeg = ffmpeg
         self.store = store
         self.on_camera_disabled = on_camera_disabled
@@ -92,12 +98,15 @@ class HKSVController:
         self.camera_active = True
         self.audio_active = False
         self._process: RecordingProcess | None = None
+        self._active_hardware: HardwareEncoder | None = None
         self._shared: Any = None
         self._process_key: tuple[RecordingConfiguration, bool] | None = None
         self._reconcile_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._restart_attempts = 0
-        self._copy_disabled = False
+        self._video_copy_disabled = False
+        self._audio_copy_disabled = False
+        self._force_software = False
         self._lock = asyncio.Lock()
         self._closed = False
         self._stream_active = False
@@ -118,7 +127,9 @@ class HKSVController:
     def _set_configuration(self, raw: bytes) -> None:
         selected = parse_selected(raw, self.capabilities)
         self.configuration = RecordingConfiguration.from_mapping(selected)
-        self._copy_disabled = False
+        self._video_copy_disabled = False
+        self._audio_copy_disabled = False
+        self._force_software = False
         self._restart_attempts = 0
         self._selected_value = b64(raw)
         self._schedule_save()
@@ -350,20 +361,34 @@ class HKSVController:
                     shared = await self.source(desired[1])
                     if shared is None:
                         raise RuntimeError("camera has no shared stream")  # noqa: TRY301
-                    copy_video = await self._probe_copy(shared, desired[0])
+                    copy_video, copy_audio = await self._probe_copy(
+                        shared, desired[0], desired[1]
+                    )
+                    hardware = None
+                    if not copy_video and not self._force_software:
+                        hardware = await _HARDWARE_PROBE.select(
+                            self.ffmpeg,
+                            desired[0].profile,
+                            desired[0].level,
+                            desired[0].width,
+                            desired[0].height,
+                            desired[0].fps,
+                        )
                     command = ffmpeg_command(
                         self.ffmpeg,
                         ["-i", "pipe:0"],
                         desired[0],
                         desired[1],
                         copy_video=copy_video,
+                        copy_audio=copy_audio,
+                        hardware=hardware,
                     )
                     process = RecordingProcess(
                         command, desired[0].prebuffer_ms / 1000, 32 * 1024 * 1024
                     )
                     source = (
-                        self._monitored_copy(shared, desired[0])
-                        if copy_video
+                        self._monitored_copy(shared, desired[0], copy_video, copy_audio)
+                        if copy_video or copy_audio
                         else shared.fragments()
                     )
                     await process.start(shared_mp4_input(source))
@@ -392,16 +417,29 @@ class HKSVController:
                     await shared.close()
                     continue
                 self._process, self._process_key = process, desired
+                self._active_hardware = hardware
                 self._shared = shared
+                _LOGGER.info(
+                    "%s: Secure Video encoder video=%s audio=%s %sx%s %sfps",
+                    self.camera_entity_id,
+                    "copy" if copy_video else hardware.codec if hardware else "libx264",
+                    "copy" if copy_audio else "aac" if desired[1] else "off",
+                    desired[0].width,
+                    desired[0].height,
+                    desired[0].fps,
+                )
                 self._monitor_task = asyncio.create_task(self._monitor(process))
                 return
 
     async def _probe_copy(
-        self, shared: SharedCameraStream, config: RecordingConfiguration
-    ) -> bool:
-        """Select copy only after observing a complete compatible window."""
-        if self._copy_disabled or not hasattr(shared, "snapshot"):
-            return False
+        self,
+        shared: SharedCameraStream,
+        config: RecordingConfiguration,
+        audio_enabled: bool,
+    ) -> tuple[bool, bool]:
+        """Select each track independently after observing a compatible window."""
+        if not hasattr(shared, "snapshot"):
+            return False, False
         deadline = time.monotonic() + 10
         while not self._closed and time.monotonic() < deadline:
             fragments = shared.snapshot()
@@ -413,13 +451,22 @@ class HKSVController:
                         (fragments[-2].data, fragments[-1].data),
                     )
                 except ValueError, OSError:
-                    return False
-                return can_copy_video(observed, config)
+                    return False, False
+                return (
+                    not self._video_copy_disabled and can_copy_video(observed, config),
+                    audio_enabled
+                    and not self._audio_copy_disabled
+                    and can_copy_audio(observed, config),
+                )
             await asyncio.sleep(0.5)
-        return False
+        return False, False
 
     async def _monitored_copy(
-        self, shared: SharedCameraStream, config: RecordingConfiguration
+        self,
+        shared: SharedCameraStream,
+        config: RecordingConfiguration,
+        copy_video: bool,
+        copy_audio: bool,
     ) -> AsyncIterator[SharedFragment]:
         """Validate each overlapping window before releasing copied media."""
         previous: SharedFragment | None = None
@@ -428,7 +475,8 @@ class HKSVController:
                 previous = fragment
                 continue
             if fragment.stream_id != previous.stream_id:
-                self._copy_disabled = True
+                self._video_copy_disabled |= copy_video
+                self._audio_copy_disabled |= copy_audio
                 return
             try:
                 observed = await asyncio.to_thread(
@@ -437,10 +485,14 @@ class HKSVController:
                     (previous.data, fragment.data),
                 )
             except ValueError, OSError:
-                self._copy_disabled = True
+                self._video_copy_disabled |= copy_video
+                self._audio_copy_disabled |= copy_audio
                 return
-            if not can_copy_video(observed, config):
-                self._copy_disabled = True
+            video_failed = copy_video and not can_copy_video(observed, config)
+            audio_failed = copy_audio and not can_copy_audio(observed, config)
+            if video_failed or audio_failed:
+                self._video_copy_disabled |= video_failed
+                self._audio_copy_disabled |= audio_failed
                 return
             yield previous
             previous = fragment
@@ -448,14 +500,22 @@ class HKSVController:
     async def _monitor(self, process: RecordingProcess) -> None:
         """Restart unexpectedly terminated encoders at most three times."""
         started = time.monotonic()
+        failed = False
         try:
             await process.wait()
         except asyncio.CancelledError:
             raise
         except Exception:
+            failed = True
             _LOGGER.exception("HKSV fragment reader failed")
         if self._closed or self._process is not process:
             return
+        hardware, self._active_hardware = self._active_hardware, None
+        if hardware is not None and (failed or process.returncode not in (None, 0)):
+            _HARDWARE_PROBE.report_failure(hardware.codec)
+            self._force_software = True
+            self._restart_attempts = 0
+            _LOGGER.warning("HKSV hardware encoder failed; switching to software")
         self._process = None
         self._process_key = None
         shared, self._shared = self._shared, None

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .hksv_config import RecordingConfiguration
+    from .hksv_hardware import HardwareEncoder
     from .hksv_stream import MediaObservation, SharedFragment
 
 _LOGGER = logging.getLogger(__name__)
@@ -256,6 +257,11 @@ class RecordingProcess:
             and not self._task.done()
         )
 
+    @property
+    def returncode(self) -> int | None:
+        """Return the encoder exit status when available."""
+        return self.process.returncode if self.process is not None else None
+
     async def wait(self) -> None:
         """Wait until the fragment reader finishes or fails."""
         if self._task is None:
@@ -306,6 +312,8 @@ def ffmpeg_command(
     audio_enabled: bool,
     *,
     copy_video: bool = False,
+    copy_audio: bool = False,
+    hardware: HardwareEncoder | None = None,
 ) -> list[str]:
     """Build a fragmented MP4 encoder using the controller's selection."""
     profiles = ("baseline", "main", "high")
@@ -324,6 +332,7 @@ def ffmpeg_command(
         "-hide_banner",
         "-loglevel",
         "error",
+        *(hardware.global_args if hardware is not None else ()),
         *input_args,
         "-map",
         "0:v:0",
@@ -331,23 +340,27 @@ def ffmpeg_command(
     if copy_video:
         command += ["-c:v", "copy"]
     else:
+        video_filter = f"scale={configuration.width}:{configuration.height}"
+        if hardware is not None:
+            video_filter += f",{hardware.video_filter}"
+        command += ["-vf", video_filter, "-r", str(configuration.fps), "-c:v"]
+        if hardware is None:
+            command += [
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
+                "-profile:v",
+                profiles[configuration.profile],
+                "-level:v",
+                levels[configuration.level],
+            ]
+        else:
+            command += [hardware.codec, *hardware.output_args]
         command += [
-            "-vf",
-            f"scale={configuration.width}:{configuration.height}",
-            "-r",
-            str(configuration.fps),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-            "-pix_fmt",
-            "yuv420p",
-            "-profile:v",
-            profiles[configuration.profile],
-            "-level:v",
-            levels[configuration.level],
             "-b:v",
             f"{configuration.video_bitrate}k",
             "-maxrate",
@@ -358,18 +371,20 @@ def ffmpeg_command(
             f"expr:gte(t,n_forced*{interval})",
         ]
     if audio_enabled:
-        command += [
-            "-map",
-            "0:a:0",
-            "-c:a",
-            "aac",
-            "-ac",
-            str(configuration.audio_channels),
-            "-ar",
-            str(sample_rates[configuration.audio_samplerate]),
-            "-b:a",
-            f"{configuration.audio_bitrate}k",
-        ]
+        command += ["-map", "0:a:0"]
+        if copy_audio:
+            command += ["-c:a", "copy"]
+        else:
+            command += [
+                "-c:a",
+                "aac",
+                "-ac",
+                str(configuration.audio_channels),
+                "-ar",
+                str(sample_rates[configuration.audio_samplerate]),
+                "-b:a",
+                f"{configuration.audio_bitrate}k",
+            ]
     else:
         command.append("-an")
     command += [
@@ -423,5 +438,29 @@ def can_copy_video(
         and 0 < observed.peak_fps <= configuration.fps
         and 0 < observed.peak_video_bitrate <= configuration.video_bitrate * 1000
         and 0 < observed.max_keyframe_interval * 1000 <= configuration.iframe_ms
+        and observed.observation_seconds >= 2
+    )
+
+
+def can_copy_audio(
+    observed: MediaObservation, configuration: RecordingConfiguration
+) -> bool:
+    """Check the observed AAC track against selected recording parameters."""
+    sample_rates = (8000, 16000, 24000, 32000, 44100, 48000)
+    if configuration.audio_samplerate >= len(sample_rates):
+        return False
+    return (
+        configuration.audio_codec == 0
+        and configuration.audio_bitrate_mode == 0
+        and observed.audio_codec == "aac"
+        and observed.audio_object_type == 2
+        and observed.audio_continuous
+        and observed.audio_rate == sample_rates[configuration.audio_samplerate]
+        and observed.audio_channels == configuration.audio_channels
+        # A one-second window can contain one partial AAC access unit extra.
+        and observed.audio_max_packet_bits > 0
+        and 0
+        < observed.audio_peak_bitrate
+        <= configuration.audio_bitrate * 1000 + observed.audio_max_packet_bits
         and observed.observation_seconds >= 2
     )
