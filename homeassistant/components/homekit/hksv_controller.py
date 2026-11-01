@@ -344,7 +344,7 @@ class HKSVController:
                 await shared.close()
 
     def _schedule_reconcile(self) -> None:
-        if self._closed:
+        if not self._ready or self._closed:
             return
         if self._reconcile_task is None or self._reconcile_task.done():
             self._reconcile_task = asyncio.create_task(self._reconcile())

@@ -347,6 +347,7 @@ async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
     monkeypatch.setattr(c.asyncio, "sleep", fast_sleep)
     controller = c.HKSVController(source, "ffmpeg", Store())
     controller.hds = HDS()
+    controller._ready = True
     controller.active = True
     controller.configuration = RecordingConfiguration(
         4000, 1, 4000, 0, 2, 500, 1000, 320, 240, 15, 0, 1, 0, 2, 32
@@ -421,3 +422,44 @@ async def test_recording_request_counts_and_safe_logging(
     assert controller._hds_completed == 1
     assert "acknowledgement not observed by delegate" in caplog.text
     assert "media" not in caplog.text
+
+
+async def test_restored_recording_waits_for_native_discovery() -> None:
+    """The restored recording cannot acquire the provider while probing owns it."""
+    discovery_started = asyncio.Event()
+    finish_discovery = asyncio.Event()
+    acquisitions = []
+
+    async def source(_with_audio: bool):
+        raise AssertionError("the stubbed reconciliation must own acquisition")
+
+    store = Store()
+    store.data = {"selected": "eA==", "active": 1, "camera_active": 1}
+    controller = c.HKSVController(source, "ffmpeg", store)
+    controller.hds = HDS()
+
+    async def discover():
+        acquisitions.append("probe-open")
+        discovery_started.set()
+        await finish_discovery.wait()
+        acquisitions.append("probe-close")
+
+    async def reconcile():
+        acquisitions.append("recording-open")
+
+    with (
+        patch.object(c, "parse_selected", return_value={}),
+        patch.object(RecordingConfiguration, "from_mapping", return_value=object()),
+        patch.object(controller, "_discover_native", side_effect=discover),
+        patch.object(controller, "_reconcile", side_effect=reconcile),
+    ):
+        startup = asyncio.create_task(controller.start())
+        await discovery_started.wait()
+        await asyncio.sleep(0)
+        assert acquisitions == ["probe-open"]
+        assert controller._reconcile_task is None
+        finish_discovery.set()
+        await startup
+        await controller._reconcile_task
+        assert acquisitions == ["probe-open", "probe-close", "recording-open"]
+    await controller.close()
