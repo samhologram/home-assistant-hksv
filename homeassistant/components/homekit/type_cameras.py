@@ -74,7 +74,7 @@ from .const import (
 from .doorbell import HomeDoorbellAccessory
 from .hksv_controller import HKSVController
 from .hksv_hardware import HARDWARE_ENCODER_PROBE as _HARDWARE_PROBE, HardwareEncoder
-from .hksv_stream import MediaObservation
+from .hksv_stream import MediaObservation, SharedCameraStream
 from .util import pid_is_alive, state_changed_event_is_same_state
 
 _LOGGER = logging.getLogger(__name__)
@@ -478,10 +478,8 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             )
         return stream_source
 
-    async def _async_get_hksv_source(self) -> Any:
+    async def _async_get_hksv_source(self) -> SharedCameraStream:
         """Attach to the audio-capable shared Home Assistant stream."""
-        from .hksv_stream import SharedCameraStream  # noqa: PLC0415
-
         if self.config.get(CONF_STREAM_SOURCE):
             raise ValueError(
                 "Explicit stream_source cannot use the shared camera stream"
@@ -623,7 +621,7 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         input_source: str,
         output: str,
         audio_proxy: AudioProxy | None,
-    ) -> tuple[HAFFmpeg, Any] | None:
+    ) -> tuple[HAFFmpeg, SharedCameraStream | None] | None:
         """Acquire the optional shared input and open its live encoder."""
         shared = None
         if self._hksv:
