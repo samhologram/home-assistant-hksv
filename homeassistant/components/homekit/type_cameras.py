@@ -1006,13 +1006,13 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
     async def async_get_snapshot(self, image_size: dict[str, int]) -> bytes:
         """Return a jpeg of a snapshot from the camera."""
         if self._hksv is None:
-            image = await camera.async_get_image(
+            camera_image = await camera.async_get_image(
                 self.hass,
                 self.entity_id,
                 width=image_size["image-width"],
                 height=image_size["image-height"],
             )
-            return image.content
+            return camera_image.content
         if self._hksv and not self._hksv.snapshot_allowed(image_size.get("reason")):
             reason = image_size.get("reason")
             raise HAPStatusError(
