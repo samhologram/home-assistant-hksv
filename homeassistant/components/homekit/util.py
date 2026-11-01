@@ -84,6 +84,7 @@ from .const import (
     CONF_MAX_FPS,
     CONF_MAX_HEIGHT,
     CONF_MAX_WIDTH,
+    CONF_SECURE_VIDEO,
     CONF_STREAM_ADDRESS,
     CONF_STREAM_COUNT,
     CONF_STREAM_SOURCE,
@@ -182,8 +183,9 @@ CAMERA_SCHEMA = BASIC_INFO_SCHEMA.extend(
             VALID_AUDIO_CODECS
         ),
         probatio.Optional(
-            CONF_SUPPORT_AUDIO, default=DEFAULT_SUPPORT_AUDIO
+            CONF_SUPPORT_AUDIO, CONF_SECURE_VIDEO, default=DEFAULT_SUPPORT_AUDIO
         ): cv.boolean,
+        probatio.Optional(CONF_SECURE_VIDEO): cv.boolean,
         probatio.Optional(CONF_MAX_WIDTH, default=DEFAULT_MAX_WIDTH): cv.positive_int,
         probatio.Optional(CONF_MAX_HEIGHT, default=DEFAULT_MAX_HEIGHT): cv.positive_int,
         probatio.Optional(CONF_MAX_FPS, default=DEFAULT_MAX_FPS): cv.positive_int,
