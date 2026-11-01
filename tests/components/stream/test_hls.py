@@ -1,13 +1,22 @@
 """The tests for hls streams."""
 
+import asyncio
 from datetime import timedelta
 from http import HTTPStatus
-from unittest.mock import patch
+from io import BytesIO
+from pathlib import Path
+import shutil
+import subprocess
+from threading import Event
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import urlparse
 
 import av
 import pytest
 
+from homeassistant.components.homekit.hksv_stream import (  # pylint: disable=home-assistant-component-root-import
+    SharedCameraStream,
+)
 from homeassistant.components.stream import Stream, create_stream
 from homeassistant.components.stream.const import (
     DOMAIN,
@@ -596,3 +605,133 @@ async def test_hls_stream_rotate(
 
     # Stop stream, if it hasn't quit already
     await stream.stop()
+
+
+async def test_hksv_output_coexists_with_hls(
+    hass: HomeAssistant, setup_component, stream_worker_sync, h264_video
+) -> None:
+    """A real stream fans out to both outputs and HKSV close leaves HLS."""
+    stream_worker_sync.pause()
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
+    hls = stream.add_provider(HLS_PROVIDER)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream))
+    try:
+        with patch(
+            "homeassistant.components.homekit.hksv_stream.get_camera_from_entity_id",
+            return_value=camera,
+        ):
+            shared = await SharedCameraStream.open(hass, "camera.test")
+        async with asyncio.timeout(5):
+            while not shared.snapshot():
+                await hls.recv()
+        assert shared.snapshot()
+        assert hls.get_segments()
+        await shared.close()
+        assert stream.outputs()[HLS_PROVIDER] is hls
+        assert "homekit_secure_video" not in stream.outputs()
+    finally:
+        stream_worker_sync.resume()
+        await stream.stop()
+
+
+async def test_hksv_audio_with_hls(
+    hass: HomeAssistant, setup_component, stream_worker_sync, tmp_path: Path
+) -> None:
+    """One real worker sends AAC-converted source audio to both outputs."""
+    if not (ffmpeg := shutil.which("ffmpeg")):
+        pytest.skip("ffmpeg unavailable")
+    path = tmp_path / "source.mkv"
+    result = await hass.async_add_executor_job(
+        lambda: subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=15",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=8000",
+                "-t",
+                "15",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "30",
+                "-c:a",
+                "pcm_alaw",
+                "-f",
+                "matroska",
+                "-y",
+                str(path),
+            ],
+            capture_output=True,
+            check=False,
+        )
+    )
+    if result.returncode:
+        pytest.skip("ffmpeg test encoders unavailable")
+    stream_worker_sync.pause()
+    stream = create_stream(hass, str(path), {}, dynamic_stream_settings())
+    hls = stream.add_provider(HLS_PROVIDER)
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream))
+    try:
+        with patch(
+            "homeassistant.components.homekit.hksv_stream.get_camera_from_entity_id",
+            return_value=camera,
+        ):
+            shared = await SharedCameraStream.open(hass, "camera.test", with_audio=True)
+        async with asyncio.timeout(5):
+            while not shared.snapshot():
+                await hls.recv()
+        fragment = shared.snapshot()[0]
+        with av.open(
+            BytesIO(fragment.initialization + fragment.data), format="mp4"
+        ) as media:
+            assert media.streams.audio[0].codec_context.name == "aac"
+        assert any(s.complete for s in hls.get_segments())
+        await shared.close()
+        assert stream.outputs()[HLS_PROVIDER] is hls
+    finally:
+        stream_worker_sync.resume()
+        await stream.stop()
+
+
+async def test_hksv_audio_activation_restarts_hls_generation(
+    hass: HomeAssistant, setup_component, stream_worker_sync, h264_video
+) -> None:
+    """Attaching audio to an existing worker creates a new shared generation."""
+    stream_worker_sync.pause()
+    stream = create_stream(hass, h264_video, {}, dynamic_stream_settings())
+    hls = stream.add_provider(HLS_PROVIDER)
+    await stream.start()
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream))
+    try:
+        async with asyncio.timeout(5):
+            while not hls.get_segments():
+                await asyncio.sleep(0.01)
+        original_generation = hls.get_segments()[-1].stream_id
+        with patch(
+            "homeassistant.components.homekit.hksv_stream.get_camera_from_entity_id",
+            return_value=camera,
+        ):
+            shared = await SharedCameraStream.open(hass, "camera.test", with_audio=True)
+        first_event = stream_worker_sync._event
+        second_event = Event()
+        stream_worker_sync._event = second_event
+        first_event.set()
+        async with asyncio.timeout(5):
+            while not shared.snapshot():
+                await asyncio.sleep(0.01)
+        assert shared.snapshot()[0].stream_id > original_generation
+        await shared.close()
+        assert stream.outputs()[HLS_PROVIDER] is hls
+    finally:
+        stream_worker_sync.resume()
+        await stream.stop()

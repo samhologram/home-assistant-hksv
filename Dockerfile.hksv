@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7
+# Build from the Home Assistant 2026.10.3 source tree with the HKSV changes.
+FROM homeassistant/home-assistant@sha256:407b89cd11a8cb67d388d21739a226c74acbbebe1ac59e3b83b11b43ce76b98f
+
+# The named context contains only the wheel built from the local HAP fork.
+COPY --from=hksv_wheel /hap_python-5.0.0.post1-py3-none-any.whl /tmp/hksv/
+RUN uv pip install --system --no-deps /tmp/hksv/hap_python-5.0.0.post1-py3-none-any.whl \
+    && rm -rf /tmp/hksv \
+    && python3 -c "from importlib.metadata import version; assert version('HAP-python') == '5.0.0.post1'"
+
+COPY homeassistant/components/homekit/ /usr/src/homeassistant/homeassistant/components/homekit/
+COPY homeassistant/components/stream/worker.py /usr/src/homeassistant/homeassistant/components/stream/worker.py
+RUN python3 -c "import json; p='/usr/src/homeassistant/homeassistant/components/homekit/translations/en.json'; assert 'camera_secure_video' in open(p).read()"

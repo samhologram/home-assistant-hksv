@@ -1,0 +1,9 @@
+**
+!homeassistant/
+!homeassistant/components/
+!homeassistant/components/homekit/
+!homeassistant/components/homekit/**
+!homeassistant/components/stream/
+!homeassistant/components/stream/worker.py
+**/__pycache__/
+**/*.pyc

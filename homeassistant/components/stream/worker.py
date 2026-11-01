@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Iterator, Mapping
 import contextlib
 from dataclasses import fields
-import datetime
+import datetime as dt
 from io import SEEK_END, BytesIO
 import logging
 import math
@@ -139,12 +139,19 @@ class StreamMuxer:
         audio_bsf: str | None,
         stream_state: StreamState,
         stream_settings: StreamSettings,
+        transcode_audio: bool = False,
     ) -> None:
         """Initialize StreamMuxer."""
         self._hass = hass
         self._input_video_stream = video_stream
         self._input_audio_stream = audio_stream
         self._audio_bsf = audio_bsf
+        self._transcode_audio = transcode_audio
+        self._audio_resampler = (
+            av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=24000)  # pylint: disable=c-extension-no-member
+            if transcode_audio
+            else None
+        )
         self._audio_bsf_context: av.BitStreamFilterContext | None = None
         self._part_has_keyframe = False
         self._stream_settings = stream_settings
@@ -255,14 +262,19 @@ class StreamMuxer:
         # Check if audio is requested
         output_astream = None
         if input_astream:
-            if self._audio_bsf:
+            if self._transcode_audio:
+                output_astream = container.add_stream("aac", rate=24000)
+                output_astream.layout = "mono"
+                output_astream.bit_rate = 32000
+            elif self._audio_bsf:
                 self._audio_bsf_context = av.BitStreamFilterContext(
                     self._audio_bsf, input_astream
                 )
-            output_astream = cast(
-                av.audio.AudioStream,
-                self._add_stream_from_template(container, input_astream),
-            )
+            if not self._transcode_audio:
+                output_astream = cast(
+                    av.audio.AudioStream,
+                    self._add_stream_from_template(container, input_astream),
+                )
         return container, output_vstream, output_astream
 
     def reset(self, video_dts: int) -> None:
@@ -306,6 +318,15 @@ class StreamMuxer:
 
         elif packet.stream == self._input_audio_stream:
             assert self._output_audio_stream
+            if self._transcode_audio:
+                assert self._audio_resampler
+                for frame in packet.decode():
+                    for converted in self._audio_resampler.resample(
+                        cast(av.AudioFrame, frame)
+                    ):
+                        for audio_packet in self._output_audio_stream.encode(converted):
+                            self._av_output.mux(audio_packet)
+                return
             if self._audio_bsf_context:
                 for audio_packet in self._audio_bsf_context.filter(packet):
                     audio_packet.stream = self._output_audio_stream
@@ -372,6 +393,9 @@ class StreamMuxer:
         if last_part:
             # Closing the av_output will write the remaining buffered data to the
             # memory_file as a new moof/mdat.
+            if self._transcode_audio and self._output_audio_stream:
+                for audio_packet in self._output_audio_stream.encode(None):
+                    self._av_output.mux(audio_packet)
             self._av_output.close()
             # With delay_moov, this may be the first time the file pointer has
             # moved, so the segment may not yet have been created
@@ -412,7 +436,7 @@ class StreamMuxer:
         if last_part:
             # If we've written the last part, we can close the memory_file.
             self._memory_file.close()  # We don't need the BytesIO object anymore
-            self._start_time += datetime.timedelta(seconds=segment_duration)
+            self._start_time += dt.timedelta(seconds=segment_duration)
             # Reinitialize
             self.reset(packet.dts)
         else:
@@ -650,10 +674,18 @@ def stream_worker(
         audio_stream = container.streams.audio[0]
     except KeyError, IndexError:
         audio_stream = None
-    if audio_stream and audio_stream.name not in AUDIO_CODECS:
+    transcode_audio = bool(
+        audio_stream
+        and audio_stream.name == "pcm_alaw"
+        and any(
+            getattr(output, "requires_aac_audio", False)
+            for output in stream_state.outputs
+        )
+    )
+    if audio_stream and audio_stream.name not in AUDIO_CODECS and not transcode_audio:
         audio_stream = None
     # Some audio streams do not have a profile and throw errors when remuxing
-    if audio_stream and audio_stream.profile is None:
+    if audio_stream and audio_stream.profile is None and not transcode_audio:
         audio_stream = None
     # Disable ll-hls for hls inputs
     if container.format.name == "hls":
@@ -728,6 +760,7 @@ def stream_worker(
         audio_bsf,
         stream_state,
         stream_settings,
+        transcode_audio=transcode_audio,
     )
     muxer.reset(start_dts)
 

@@ -13,6 +13,7 @@ from pyhap.camera import (
     Camera as PyhapCamera,
 )
 from pyhap.const import CATEGORY_CAMERA
+from pyhap.hap_handler import HAPStatusError
 from pyhap.util import callback as pyhap_callback
 
 from homeassistant.components import camera
@@ -30,6 +31,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.storage import Store
 from homeassistant.util.async_ import create_eager_task
 
 from .accessories import TYPES, HomeDriver
@@ -42,6 +44,7 @@ from .const import (
     CONF_MAX_FPS,
     CONF_MAX_HEIGHT,
     CONF_MAX_WIDTH,
+    CONF_SECURE_VIDEO,
     CONF_STREAM_ADDRESS,
     CONF_STREAM_COUNT,
     CONF_STREAM_SOURCE,
@@ -65,6 +68,7 @@ from .const import (
     SERV_MOTION_SENSOR,
 )
 from .doorbell import HomeDoorbellAccessory
+from .hksv_controller import HKSVController
 from .util import pid_is_alive, state_changed_event_is_same_state
 
 _LOGGER = logging.getLogger(__name__)
@@ -216,6 +220,9 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             options=options,
         )
 
+        self._hksv: HKSVController | None = None
+        self._hksv_stream_chars: list[Any] = []
+        self._hksv_motion_active: Any = None
         self._char_motion_detected = None
         self.linked_motion_sensor: str | None = self.config.get(
             CONF_LINKED_MOTION_SENSOR
@@ -223,12 +230,101 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         self.motion_is_event = False
         if linked_motion_sensor := self.linked_motion_sensor:
             self.motion_is_event = linked_motion_sensor.startswith("event.")
-            if state := self.hass.states.get(linked_motion_sensor):
+            state = self.hass.states.get(linked_motion_sensor)
+            if state is not None or self.config.get(CONF_SECURE_VIDEO, False):
                 serv_motion = self.add_preload_service(SERV_MOTION_SENSOR)
                 self._char_motion_detected = serv_motion.configure_char(
                     CHAR_MOTION_DETECTED, value=False
                 )
-                self._async_update_motion_state(None, state)
+                if state is not None:
+                    self._async_update_motion_state(None, state)
+
+        if self.config.get(CONF_SECURE_VIDEO, False):
+            if self.config.get(CONF_STREAM_SOURCE):
+                _LOGGER.error(
+                    "%s: Secure Video is unavailable with an explicit stream source; "
+                    "the live camera remains available",
+                    self.entity_id,
+                )
+            elif not self._char_motion_detected:
+                _LOGGER.error(
+                    "%s: Secure Video requires a linked motion sensor", self.entity_id
+                )
+            elif max_width < 1920 or max_height < 1080 or max_fps < 30:
+                _LOGGER.error(
+                    "%s: Secure Video requires 1920x1080 at 30 fps", self.entity_id
+                )
+            else:
+                try:
+                    controller = HKSVController(
+                        self._async_get_hksv_source,
+                        self._ffmpeg.binary,
+                        Store(
+                            self.hass,
+                            1,
+                            f"homekit.hksv.{self.driver.entry_id}.{self.entity_id}",
+                        ),
+                        self._hksv_stop_live,
+                        self._hksv_sync_characteristics,
+                    )
+                except Exception:
+                    _LOGGER.exception(
+                        "%s: Could not initialize Secure Video", self.entity_id
+                    )
+                else:
+                    services = controller.services
+                    self.add_service(
+                        services.recording, services.operating, services.transport
+                    )
+                    services.recording.add_linked_service(services.transport)
+                    services.recording.add_linked_service(serv_motion)
+                    self._hksv = controller
+                    self._hksv_motion_active = self._hksv_add_characteristic(
+                        serv_motion, "StatusActive", True
+                    )
+                    for index, management in enumerate(self._management):
+                        char = self._hksv_add_characteristic(management, "Active", 1)
+                        char.session_setter_callback = (
+                            lambda value, session, index=index, char=char: (
+                                self._hksv_set_stream_active(index, char, value)
+                            )
+                        )
+                        self._hksv_stream_chars.append(char)
+
+    def _hksv_add_characteristic(self, service: Any, name: str, value: Any) -> Any:
+        """Attach a characteristic before the accessory is advertised."""
+        char = self.driver.loader.get_char(name)
+        service.add_characteristic(char)
+        char.broker = self
+        self.iid_manager.assign(char)
+        char.set_value(value, should_notify=False)
+        return char
+
+    @callback
+    def _hksv_sync_characteristics(self) -> None:
+        """Reflect restored operating mode and per-stream settings."""
+        assert self._hksv is not None
+        for index, char in enumerate(self._hksv_stream_chars):
+            char.set_value(int(self._hksv.stream_active(index)))
+        if self._hksv_motion_active is not None:
+            self._hksv_motion_active.set_value(self._hksv.camera_active)
+
+    @callback
+    def _hksv_set_stream_active(self, index: int, char: Any, value: Any) -> None:
+        """Update the authenticated controller's individual RTP setting."""
+        assert self._hksv is not None
+        if not self._hksv.ready or value not in (0, 1):
+            raise ValueError("Invalid stream active state")
+        self._hksv.set_stream_active(index, value)
+        char.set_value(value)
+
+    @callback
+    def _hksv_stop_live(self) -> None:
+        """Stop existing live streams when the HomeKit camera is disabled."""
+        for session_info in list(self.sessions.values()):
+            self.hass.async_create_background_task(
+                self.stop_stream(session_info), "homekit.camera-stop-stream"
+            )
 
     @pyhap_callback  # type: ignore[untyped-decorator]
     @callback
@@ -249,6 +345,10 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 )
             )
 
+        if self._hksv:
+            self.hass.async_create_background_task(
+                self._hksv.start(), "homekit.hksv-start"
+            )
         super().run()
 
     @callback
@@ -281,11 +381,16 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 self.entity_id,
                 self.linked_motion_sensor,
             )
+            if self._hksv is not None:
+                self._hksv.motion(True)
+                self._hksv.motion(False)
             char.set_value(True)
             char.set_value(False)
             return
 
         detected = state == STATE_ON
+        if self._hksv is not None:
+            self._hksv.motion(detected)
         if char.value == detected:
             return
 
@@ -301,6 +406,14 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
     @override
     def async_update_state(self, new_state: State | None) -> None:
         """Handle state change to update HomeKit value."""
+
+    async def _async_get_hksv_source(self, with_audio: bool) -> Any:
+        """Attach recording to the camera's shared Home Assistant stream."""
+        from .hksv_stream import SharedCameraStream  # noqa: PLC0415
+
+        return await SharedCameraStream.open(
+            self.hass, self.entity_id, with_audio=with_audio
+        )
 
     async def _async_get_stream_source(self) -> str | None:
         """Find the camera stream source url."""
@@ -322,6 +435,12 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         self, session_info: dict[str, Any], stream_config: dict[str, Any]
     ) -> bool:
         """Start a new stream with the given configuration."""
+        if self._hksv and (
+            not self._hksv.privacy_ready
+            or not self._hksv.camera_active
+            or not self._hksv.stream_active(session_info["stream_idx"])
+        ):
+            raise RuntimeError("HomeKit camera stream is disabled")
         _LOGGER.debug(
             "[%s] Starting stream with the following parameters: %s",
             session_info["id"],
@@ -472,6 +591,13 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             )
         super().async_stop()
 
+    @override
+    async def stop(self) -> None:
+        """Stop recording and HDS before completing accessory teardown."""
+        if self._hksv:
+            await self._hksv.close()
+        await super().stop()
+
     async def stop_stream(self, session_info: dict[str, Any]) -> None:
         """Stop the stream for the given ``session_id``."""
         session_id = session_info["id"]
@@ -507,6 +633,11 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
 
     async def async_get_snapshot(self, image_size: dict[str, int]) -> bytes:
         """Return a jpeg of a snapshot from the camera."""
+        if self._hksv and not self._hksv.snapshot_allowed(image_size.get("reason")):
+            reason = image_size.get("reason")
+            raise HAPStatusError(
+                -70401 if reason is None and self._hksv.camera_active else -70412
+            )
         image = await camera.async_get_image(
             self.hass,
             self.entity_id,
