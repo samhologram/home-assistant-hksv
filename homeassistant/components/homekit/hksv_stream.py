@@ -215,6 +215,7 @@ class MediaObservation:
     audio_object_type: int = 0
     audio_max_packet_bits: int = 0
     audio_continuous: bool = False
+    h264_compatibility: int = 0
 
 
 def inspect_recording(
@@ -322,4 +323,5 @@ def inspect_recording(
                 and audio_last is not None
                 and audio_last - audio_first >= duration - 0.25
             ),
+            extra[2] if is_h264 else 0,
         )

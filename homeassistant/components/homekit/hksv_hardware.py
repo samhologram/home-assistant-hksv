@@ -187,3 +187,6 @@ class HardwareEncoderProbe:
                 with suppress(ProcessLookupError):
                     proc.kill()
                 await proc.wait()
+
+
+HARDWARE_ENCODER_PROBE = HardwareEncoderProbe()

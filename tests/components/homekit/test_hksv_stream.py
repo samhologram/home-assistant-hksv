@@ -1,5 +1,6 @@
 """Tests for the dedicated HKSV shared stream output."""
 
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 import shutil
@@ -21,6 +22,7 @@ from homeassistant.components.stream.diagnostics import (  # pylint: disable=hom
     Diagnostics,
 )
 from homeassistant.components.stream.worker import (  # pylint: disable=home-assistant-component-root-import
+    AudioTimestampNormalizer,
     StreamEndedError,
     StreamState,
     stream_worker,
@@ -259,3 +261,113 @@ def test_shared_worker_transcodes_alaw_only_when_requested(tmp_path: Path) -> No
                     assert video_times and audio_times
                     assert abs(video_times[0] - audio_times[0]) < 0.3
                     assert abs(video_times[-1] - audio_times[-1]) < 0.3
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_mux_failure_diagnostic_is_scoped_and_redacted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, requested: bool
+) -> None:
+    """Only the HKSV audio path logs packet metadata, without the source."""
+    from unittest.mock import patch  # noqa: PLC0415
+
+    from homeassistant.components.stream.worker import (  # noqa: PLC0415  # pylint: disable=home-assistant-component-root-import
+        StreamMuxer,
+        StreamWorkerError,
+    )
+
+    if not (ffmpeg := shutil.which("ffmpeg")):
+        pytest.skip("ffmpeg unavailable")
+    path = tmp_path / "private-camera-secret.mkv"
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=15",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=8000",
+            "-t",
+            "5",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "30",
+            "-c:a",
+            "pcm_alaw",
+            "-f",
+            "matroska",
+            "-y",
+            str(path),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        pytest.skip("ffmpeg test encoders unavailable")
+    output = Mock(requires_aac_audio=requested)
+    hass = Mock()
+    hass.loop.call_soon_threadsafe.side_effect = lambda callback, *args: callback(*args)
+    state = StreamState(hass, lambda: {"test": output}, Diagnostics())
+    settings = StreamSettings(False, 1.5, 2, 3, 2)
+    original = StreamMuxer.mux_packet
+    count = 0
+
+    def fail_after_first(muxer, packet):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise av.FFmpegError(
+                22, "invalid input", "rtsp://user:private-secret@camera/stream"
+            )
+        return original(muxer, packet)
+
+    with (
+        patch.object(StreamMuxer, "mux_packet", fail_after_first),
+        pytest.raises(StreamWorkerError),
+    ):
+        stream_worker(str(path), {}, settings, state, Mock(), Event())
+    messages = [
+        record.message
+        for record in caplog.records
+        if "HKSV shared mux failed" in record.message
+    ]
+    if requested:
+        assert len(messages) == 1
+        assert all(
+            label in messages[0]
+            for label in (
+                "track=",
+                "dts=",
+                "pts=",
+                "time_base=",
+                "keyframe=",
+                "video_codec=h264",
+                "audio_transcode=true",
+                "errno=22",
+            )
+        )
+        assert "private" not in messages[0] and "rtsp" not in messages[0]
+    else:
+        assert messages == []
+
+
+def test_audio_timestamps_clamp_overlap_and_preserve_gap() -> None:
+    """Real camera overlap is repaired without discarding forward gaps."""
+    clock = AudioTimestampNormalizer()
+    actual = []
+    for pts in (3130, 4154, 4170, 5194, 10000):
+        frame = av.AudioFrame(format="s16", layout="mono", samples=1024)
+        frame.sample_rate = 8000
+        frame.time_base = Fraction(1, 8000)
+        frame.pts = pts
+        clock.normalize(frame)
+        actual.append(frame.pts)
+    assert actual == [3130, 4154, 5178, 6202, 10000]

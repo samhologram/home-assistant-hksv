@@ -50,15 +50,18 @@ from .const import (
     CONF_HOMEKIT_MODE,
     CONF_LINKED_MOTION_SENSOR,
     CONF_SECURE_VIDEO,
+    CONF_SECURE_VIDEO_PREBUFFER,
     CONF_STREAM_SOURCE,
     CONF_SUPPORT_AUDIO,
     CONF_VIDEO_CODEC,
     DEFAULT_CONFIG_FLOW_PORT,
     DEFAULT_HOMEKIT_MODE,
+    DEFAULT_SECURE_VIDEO_PREBUFFER,
     DOMAIN,
     HOMEKIT_MODE_ACCESSORY,
     HOMEKIT_MODE_BRIDGE,
     HOMEKIT_MODES,
+    SECURE_VIDEO_PREBUFFER_OPTIONS,
     SHORT_BRIDGE_NAME,
     TYPE_HEATER_COOLER,
     TYPE_THERMOSTAT,
@@ -645,6 +648,9 @@ class OptionsFlowHandler(OptionsFlow):
             self.hk_options[CONF_ENTITY_CONFIG][entity_id][
                 CONF_LINKED_MOTION_SENSOR
             ] = user_input[CONF_LINKED_MOTION_SENSOR]
+            self.hk_options[CONF_ENTITY_CONFIG][entity_id][
+                CONF_SECURE_VIDEO_PREBUFFER
+            ] = user_input[CONF_SECURE_VIDEO_PREBUFFER]
         if not self._hksv_pending:
             return await self.async_step_climate()
         entity_id = self._hksv_pending[0]
@@ -656,7 +662,13 @@ class OptionsFlowHandler(OptionsFlow):
                     CONF_LINKED_MOTION_SENSOR, default=default
                 ): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain=["binary_sensor", "event"])
-                )
+                ),
+                probatio.Required(
+                    CONF_SECURE_VIDEO_PREBUFFER,
+                    default=config.get(
+                        CONF_SECURE_VIDEO_PREBUFFER, DEFAULT_SECURE_VIDEO_PREBUFFER
+                    ),
+                ): probatio.In(SECURE_VIDEO_PREBUFFER_OPTIONS),
             }
         )
         return self.async_show_form(

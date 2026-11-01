@@ -17,6 +17,8 @@ from homeassistant.components.homekit.const import (
     CONF_STREAM_SOURCE,
     SERV_MOTION_SENSOR,
 )
+from homeassistant.components.homekit.hksv_hardware import HardwareEncoder
+from homeassistant.components.homekit.hksv_stream import MediaObservation
 from homeassistant.components.homekit.type_cameras import FFMPEG_PID, Camera
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
@@ -253,3 +255,168 @@ async def test_live_failure_reports_only_safe_categories(
     assert "secret" not in caplog.text
     assert "rtsp://" not in caplog.text
     accessory.sessions.clear()
+
+
+@pytest.mark.parametrize(
+    (
+        "source_width",
+        "source_height",
+        "source_profile",
+        "source_level",
+        "expected_codec",
+        "hardware",
+    ),
+    [
+        (1280, 720, 100, 31, "copy", None),
+        (2560, 1920, 100, 50, "libx264", None),
+        (
+            2560,
+            1920,
+            100,
+            50,
+            "h264_vaapi",
+            HardwareEncoder(
+                "h264_vaapi",
+                ("-vaapi_device", "/dev/dri/render" + "D128"),
+                "format=nv12,hwupload",
+                ("-profile:v", "high", "-level:v", "4.0"),
+            ),
+        ),
+    ],
+)
+async def test_secure_video_live_uses_codec_matching_negotiation(
+    hass: HomeAssistant,
+    run_driver,
+    source_width: int,
+    source_height: int,
+    source_profile: int,
+    source_level: int,
+    expected_codec: str,
+    hardware: HardwareEncoder | None,
+) -> None:
+    """Keep compatible video copied and scale incompatible video to the selection."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.demo_camera", "idle")
+    accessory = Camera(
+        hass, run_driver, "Camera", "camera.demo_camera", 2, {"video_codec": "copy"}
+    )
+    observed = MediaObservation(
+        "h264",
+        source_profile,
+        source_level,
+        source_width,
+        source_height,
+        None,
+        None,
+        None,
+        None,
+        15,
+        2,
+        15,
+        900_000,
+        800_000,
+        4,
+    )
+    accessory._hksv = SimpleNamespace(
+        privacy_ready=True,
+        camera_active=True,
+        stream_active=lambda _index: True,
+        observe_live_source=AsyncMock(return_value=observed),
+    )
+    session = {"id": "live-test", "stream_idx": 0}
+    accessory.sessions["live-test"] = session
+    selection = {
+        "v_profile_id": b"\x02",
+        "v_level": b"\x02",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "v_max_bitrate": 1500,
+        "a_max_bitrate": 32,
+        "address": "127.0.0.1",
+        "v_port": 12345,
+        "v_srtp_key": "synthetic",
+        "v_ssrc": 12345,
+    }
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    process = SimpleNamespace(pid=12345, returncode=None)
+    ffmpeg_process = SimpleNamespace(
+        process=process,
+        open=AsyncMock(return_value=True),
+        get_reader=AsyncMock(return_value=reader),
+    )
+    with (
+        patch.object(
+            accessory, "_async_get_stream_source", AsyncMock(return_value="/dev/null")
+        ),
+        patch(
+            "homeassistant.components.homekit.type_cameras.HAFFmpeg",
+            return_value=ffmpeg_process,
+        ),
+        patch(
+            "homeassistant.components.homekit.type_cameras._HARDWARE_PROBE.select",
+            AsyncMock(return_value=hardware),
+        ),
+        patch.object(accessory, "_async_ffmpeg_watch", AsyncMock(return_value=True)),
+    ):
+        assert await accessory.start_stream(session, selection)
+        output = ffmpeg_process.open.call_args.kwargs["output"]
+        assert f"-c:v {expected_codec}" in output
+        if expected_codec != "copy":
+            assert "scale=1280:720:force_original_aspect_ratio=decrease" in output
+            assert "pad=1280:720:(ow-iw)/2:(oh-ih)/2" in output
+            if hardware:
+                assert "hwupload" in output
+                assert (
+                    "-vaapi_device"
+                    in ffmpeg_process.open.call_args.kwargs["input_source"]
+                )
+        else:
+            assert "scale=" not in output
+        accessory._async_stop_ffmpeg_watch("live-test")
+    accessory.sessions.clear()
+
+
+async def test_live_permission_rechecked_after_media_observation(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A HomeKit privacy change during inspection prevents FFmpeg startup."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.demo_camera", "idle")
+    accessory = Camera(
+        hass, run_driver, "Camera", "camera.demo_camera", 2, {"video_codec": "copy"}
+    )
+    hksv = SimpleNamespace(
+        privacy_ready=True, camera_active=True, stream_active=lambda _index: True
+    )
+
+    async def observe() -> None:
+        hksv.camera_active = False
+
+    hksv.observe_live_source = observe
+    accessory._hksv = hksv
+    session = {"id": "privacy-test", "stream_idx": 0}
+    selection = {
+        "v_profile_id": b"\x02",
+        "v_level": b"\x02",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "v_max_bitrate": 1500,
+        "a_max_bitrate": 32,
+        "address": "127.0.0.1",
+        "v_port": 12345,
+        "v_srtp_key": "synthetic",
+        "v_ssrc": 12345,
+    }
+    with (
+        patch.object(
+            accessory, "_async_get_stream_source", AsyncMock(return_value="/dev/null")
+        ),
+        patch(
+            "homeassistant.components.homekit.type_cameras.HAFFmpeg"
+        ) as ffmpeg_factory,
+    ):
+        assert not await accessory.start_stream(session, selection)
+        ffmpeg_factory.assert_not_called()

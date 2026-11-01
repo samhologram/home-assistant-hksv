@@ -620,3 +620,18 @@ async def test_audio_violation_does_not_disable_video_copy(
     ] == [b"one"]
     assert controller._audio_copy_disabled
     assert not controller._video_copy_disabled
+
+
+def test_eight_second_prebuffer_retains_longer_history_within_budget() -> None:
+    """An eight-second setting retains older whole fragments without exceeding its cap."""
+    four = FragmentBuffer(4, 12)
+    eight = FragmentBuffer(8, 12)
+    for buffer in (four, eight):
+        buffer.set_initialization(b"i")
+        buffer.append(b"aa", 0)
+        buffer.append(b"bb", 4)
+        buffer.append(b"cc", 8)
+    assert four.snapshot(9)[1] == (b"cc",)
+    assert eight.snapshot(9)[1] == (b"bb", b"cc")
+    eight.append(b"ddddddddd", 10)
+    assert eight.snapshot(10)[1] == (b"cc", b"ddddddddd")

@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 import logging
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 from pyhap.datastream import HDSReject, HDSServer
 from pyhap.secure_video import HKSVServices, RecordingCapabilities, b64, parse_selected
@@ -17,7 +17,7 @@ from pyhap.secure_video import HKSVServices, RecordingCapabilities, b64, parse_s
 from homeassistant.exceptions import HomeAssistantError
 
 from .hksv_config import RecordingConfiguration
-from .hksv_hardware import HardwareEncoder, HardwareEncoderProbe
+from .hksv_hardware import HARDWARE_ENCODER_PROBE as _HARDWARE_PROBE, HardwareEncoder
 from .hksv_media import (
     RecordingProcess,
     can_copy_audio,
@@ -25,10 +25,14 @@ from .hksv_media import (
     ffmpeg_command,
     shared_mp4_input,
 )
-from .hksv_stream import SharedCameraStream, SharedFragment, inspect_recording
+from .hksv_stream import (
+    MediaObservation,
+    SharedCameraStream,
+    SharedFragment,
+    inspect_recording,
+)
 
 _LOGGER = logging.getLogger(__name__)
-_HARDWARE_PROBE = HardwareEncoderProbe()
 
 
 class HKSVController:
@@ -44,8 +48,11 @@ class HKSVController:
         on_stream_disabled: Callable[[int], None] | None = None,
         *,
         camera_entity_id: str = "camera",
+        prebuffer_seconds: int = 4,
     ) -> None:
         """Initialize detached services and the recording lifecycle."""
+        if prebuffer_seconds not in (4, 8):
+            raise ValueError("Unsupported Secure Video prebuffer")
         self.source = source
         self.camera_entity_id = camera_entity_id
         self.ffmpeg = ffmpeg
@@ -66,6 +73,7 @@ class HKSVController:
             2,
             0,
             2,
+            prebuffer_ms=prebuffer_seconds * 1000,
             resolutions=(
                 (1280, 720, 15),
                 (1280, 720, 30),
@@ -112,6 +120,10 @@ class HKSVController:
         self._lock = asyncio.Lock()
         self._closed = False
         self._stream_active = False
+        self._hds_accepted = 0
+        self._hds_rejected = 0
+        self._hds_completed = 0
+        self._hds_interrupted = 0
         self._motion_until = 0.0
         self._motion_detected = False
 
@@ -433,6 +445,26 @@ class HKSVController:
                 self._monitor_task = asyncio.create_task(self._monitor(process))
                 return
 
+    async def observe_live_source(self) -> MediaObservation | None:
+        """Inspect current shared media without opening another camera connection."""
+        shared = self._shared
+        if shared is None:
+            return None
+        try:
+            fragments = shared.snapshot()
+            if len(fragments) < 2:
+                return None
+            observed = await asyncio.to_thread(
+                inspect_recording,
+                fragments[-2].initialization,
+                (fragments[-2].data, fragments[-1].data),
+            )
+        except Exception:  # noqa: BLE001 - optional inspection must not block live video
+            _LOGGER.debug("Could not inspect shared source for live video")
+            return None
+        else:
+            return observed if shared is self._shared else None
+
     async def _probe_copy(
         self,
         shared: SharedCameraStream,
@@ -536,26 +568,44 @@ class HKSVController:
         if not self._closed:
             self._schedule_reconcile()
 
+    def _reject_recording(self, reason: int, category: str) -> NoReturn:
+        self._hds_rejected += 1
+        _LOGGER.info(
+            "%s: Secure Video recording request rejected category=%s total_rejected=%s",
+            self.camera_entity_id,
+            category,
+            self._hds_rejected,
+        )
+        raise HDSReject(reason)
+
     def _open_recording(
         self, owner: object, stream_id: int
     ) -> AsyncIterator[tuple[bytes, bool]]:
         if not self._ready or not self.active or not self.camera_active:
-            raise HDSReject(1)
+            self._reject_recording(1, "inactive")
         if self.configuration is None:
-            raise HDSReject(9)
+            self._reject_recording(9, "configuration")
         if self._stream_active:
-            raise HDSReject(2)
+            self._reject_recording(2, "busy")
         process = self._process
         if process is None or not process.running:
-            raise HDSReject(5)
+            self._reject_recording(5, "buffer_unavailable")
+        self._hds_accepted += 1
+        _LOGGER.info(
+            "%s: Secure Video recording request accepted by delegate total_accepted=%s",
+            self.camera_entity_id,
+            self._hds_accepted,
+        )
         return self._recording(process)
 
     async def _recording(
         self, process: RecordingProcess
     ) -> AsyncIterator[tuple[bytes, bool]]:
         if self._stream_active:
-            raise HDSReject(2)
+            self._reject_recording(2, "busy")
         self._stream_active = True
+        completed = False
+        media_fragments = 0
         try:
             start = time.monotonic()
             first = True
@@ -564,6 +614,7 @@ class HKSVController:
                     first = False
                     yield fragment, False
                     continue
+                media_fragments += 1
                 # A HomeKit request is itself an event; allow a full fragment even
                 # if motion was only a short event pulse. Cap individual clips.
                 last = (
@@ -579,9 +630,25 @@ class HKSVController:
                 )
                 yield fragment, last
                 if last:
+                    completed = True
+                    self._hds_completed += 1
+                    _LOGGER.info(
+                        "%s: Secure Video final fragment handed to transport fragments=%s total_completed=%s; acknowledgement not observed by delegate",
+                        self.camera_entity_id,
+                        media_fragments,
+                        self._hds_completed,
+                    )
                     return
         finally:
             self._stream_active = False
+            if not completed:
+                self._hds_interrupted += 1
+                _LOGGER.info(
+                    "%s: Secure Video recording producer interrupted fragments=%s total_interrupted=%s",
+                    self.camera_entity_id,
+                    media_fragments,
+                    self._hds_interrupted,
+                )
 
     async def close(self) -> None:
         """Stop sessions, background reconciliation and the FFmpeg child."""

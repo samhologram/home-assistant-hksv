@@ -73,9 +73,10 @@
       },
       "secure_video": {
         "data": {
-          "linked_motion_sensor": "Motion sensor"
+          "linked_motion_sensor": "Motion sensor",
+          "secure_video_prebuffer": "Prebuffer (seconds)"
         },
-        "description": "Choose the motion sensor that triggers recording for {camera}."
+        "description": "Choose the motion sensor and prebuffer duration for {camera}."
       },
       "yaml": {
         "description": "This entry is controlled via YAML",

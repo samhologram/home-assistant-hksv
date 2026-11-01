@@ -5,6 +5,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping
 import contextlib
 from dataclasses import fields
 import datetime as dt
+from fractions import Fraction
 from io import SEEK_END, BytesIO
 import logging
 import math
@@ -118,6 +119,35 @@ class StreamState:
         return self._diagnostics
 
 
+class AudioTimestampNormalizer:
+    """Keep decoded audio frames on a monotonic source-sample clock."""
+
+    def __init__(self) -> None:
+        """Initialize the clock for one source generation."""
+        self._sample_rate: int | None = None
+        self._next_pts: int | None = None
+
+    def normalize(self, frame: av.AudioFrame) -> None:
+        """Preserve forward gaps but clamp timestamps that overlap prior samples."""
+        sample_rate = frame.sample_rate
+        if not sample_rate or (
+            self._sample_rate is not None and sample_rate != self._sample_rate
+        ):
+            raise StreamWorkerError("Audio sample rate changed or is unavailable")
+        self._sample_rate = sample_rate
+        if frame.pts is not None and frame.time_base is not None:
+            pts = round(frame.pts * frame.time_base * sample_rate)
+        elif self._next_pts is not None:
+            pts = self._next_pts
+        else:
+            raise StreamWorkerError("Audio timestamp unavailable")
+        if self._next_pts is not None:
+            pts = max(pts, self._next_pts)
+        frame.pts = pts
+        frame.time_base = Fraction(1, sample_rate)
+        self._next_pts = pts + frame.samples
+
+
 class StreamMuxer:
     """StreamMuxer re-packages video/audio packets for output."""
 
@@ -147,6 +177,7 @@ class StreamMuxer:
         self._input_audio_stream = audio_stream
         self._audio_bsf = audio_bsf
         self._transcode_audio = transcode_audio
+        self._audio_timestamps = AudioTimestampNormalizer() if transcode_audio else None
         self._audio_resampler = (
             av.audio.resampler.AudioResampler(format="fltp", layout="mono", rate=24000)  # pylint: disable=c-extension-no-member
             if transcode_audio
@@ -320,10 +351,11 @@ class StreamMuxer:
             assert self._output_audio_stream
             if self._transcode_audio:
                 assert self._audio_resampler
+                assert self._audio_timestamps
                 for frame in packet.decode():
-                    for converted in self._audio_resampler.resample(
-                        cast(av.AudioFrame, frame)
-                    ):
+                    audio_frame = cast(av.AudioFrame, frame)
+                    self._audio_timestamps.normalize(audio_frame)
+                    for converted in self._audio_resampler.resample(audio_frame):
                         for audio_packet in self._output_audio_stream.encode(converted):
                             self._av_output.mux(audio_packet)
                 return
@@ -785,9 +817,27 @@ def stream_worker(
                     f"Error demuxing stream ({redact_av_error_string(ex)})"
                 ) from ex
 
+            packet_details = (
+                (
+                    packet.stream.type,
+                    packet.dts,
+                    packet.pts,
+                    str(packet.time_base),
+                    packet.is_keyframe,
+                )
+                if transcode_audio
+                else None
+            )
             try:
                 muxer.mux_packet(packet)
             except av.FFmpegError as ex:
+                if packet_details is not None:
+                    _LOGGER.warning(
+                        "HKSV shared mux failed: track=%s dts=%s pts=%s time_base=%s keyframe=%s video_codec=%s audio_transcode=true errno=%s",
+                        *packet_details,
+                        video_stream.name,
+                        ex.errno,
+                    )
                 raise StreamWorkerError(
                     f"Error muxing stream ({redact_av_error_string(ex)})"
                 ) from ex

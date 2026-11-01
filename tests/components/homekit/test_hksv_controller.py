@@ -1,6 +1,8 @@
 """Isolated lifecycle checks for the experimental HKSV controller."""
 
 import asyncio
+from collections.abc import AsyncIterator
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -357,3 +359,65 @@ async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
         assert controller._process is not None
     finally:
         await controller.close()
+
+
+@pytest.mark.parametrize(("seconds", "milliseconds"), [(4, 4000), (8, 8000)])
+def test_selected_prebuffer_capability(seconds: int, milliseconds: int) -> None:
+    """Advertise the selected recording pre-roll without starting a process."""
+
+    async def source(_with_audio: bool):
+        return None
+
+    controller = c.HKSVController(source, "ffmpeg", Store(), prebuffer_seconds=seconds)
+    assert controller.capabilities.prebuffer_ms == milliseconds
+    assert not controller.active
+    assert controller._process is None
+
+
+def test_invalid_prebuffer_rejected() -> None:
+    """Unsupported pre-roll values cannot be advertised."""
+
+    async def source(_with_audio: bool):
+        return None
+
+    with pytest.raises(ValueError, match="prebuffer"):
+        c.HKSVController(source, "ffmpeg", Store(), prebuffer_seconds=6)
+
+
+async def test_recording_request_counts_and_safe_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Count delegated requests and label completion without claiming an ACK."""
+
+    async def source(_with_audio: bool) -> None:
+        return None
+
+    class Process:
+        running = True
+
+        async def fragments(self) -> AsyncIterator[bytes]:
+            yield b"initialization"
+            yield b"media"
+
+    controller = c.HKSVController(
+        source, "ffmpeg", Store(), camera_entity_id="camera.test"
+    )
+    caplog.set_level(logging.INFO, logger=c.__name__)
+    with pytest.raises(c.HDSReject):
+        controller._open_recording(object(), 1)
+    assert controller._hds_rejected == 1
+    assert "category=inactive" in caplog.text
+    controller._ready = True
+    controller.active = True
+    controller.configuration = object()
+    controller._process = Process()
+    recording = controller._open_recording(object(), 2)
+    controller._closed = True
+    assert [fragment async for fragment in recording] == [
+        (b"initialization", False),
+        (b"media", True),
+    ]
+    assert controller._hds_accepted == 1
+    assert controller._hds_completed == 1
+    assert "acknowledgement not observed by delegate" in caplog.text
+    assert "media" not in caplog.text

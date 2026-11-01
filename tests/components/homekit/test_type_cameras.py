@@ -954,15 +954,16 @@ async def test_camera_with_linked_motion_event(hass: HomeAssistant, run_driver) 
     broker.reset_mock()
     assert char.value is False
 
-    char.set_value(True)
     fire_time = dt_util.utcnow().isoformat()
     hass.states.async_set(
         motion_entity_id, fire_time, {ATTR_DEVICE_CLASS: EventDeviceClass.MOTION}
     )
     await hass.async_block_till_done()
-    assert len(broker.mock_calls) == 4
-    broker.reset_mock()
+    assert char.value is True
+    assert broker.mock_calls
+    await asyncio.sleep(1.1)
     assert char.value is False
+    broker.reset_mock()
 
     hass.states.async_set(
         motion_entity_id,
@@ -1009,6 +1010,8 @@ async def test_camera_with_linked_motion_event(hass: HomeAssistant, run_driver) 
     await hass.async_block_till_done()
     assert broker.mock_calls
 
+    await asyncio.sleep(1.1)
+
     # Now go unavailable
     broker.reset_mock()
     hass.states.async_set(
@@ -1037,6 +1040,7 @@ async def test_camera_with_linked_motion_event(hass: HomeAssistant, run_driver) 
     )
     await hass.async_block_till_done()
     assert broker.mock_calls
+    acc.async_stop()
 
 
 async def test_camera_with_a_missing_linked_motion_sensor(

@@ -1907,7 +1907,8 @@ async def test_options_flow_climate_step_with_whole_domain_included(
     await hass.config_entries.async_unload(config_entry.entry_id)
 
 
-async def test_options_flow_secure_video(hass: HomeAssistant) -> None:
+@pytest.mark.parametrize("prebuffer", [4, 8])
+async def test_options_flow_secure_video(hass: HomeAssistant, prebuffer: int) -> None:
     """Configure secure video and its motion sensor for a camera."""
     config_entry = _mock_config_entry_with_options_populated()
     config_entry.add_to_hass(hass)
@@ -1926,9 +1927,25 @@ async def test_options_flow_secure_video(hass: HomeAssistant) -> None:
         result["flow_id"], user_input={"camera_secure_video": ["camera.front"]}
     )
     assert result["step_id"] == "secure_video"
+    assert (
+        result["data_schema"]({"linked_motion_sensor": "binary_sensor.front_motion"})[
+            "secure_video_prebuffer"
+        ]
+        == 4
+    )
+    with pytest.raises(probatio.error.Invalid):
+        result["data_schema"](
+            {
+                "linked_motion_sensor": "binary_sensor.front_motion",
+                "secure_video_prebuffer": 6,
+            }
+        )
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
-        user_input={"linked_motion_sensor": "binary_sensor.front_motion"},
+        user_input={
+            "linked_motion_sensor": "binary_sensor.front_motion",
+            "secure_video_prebuffer": prebuffer,
+        },
     )
     assert result["step_id"] == "bridged_device_triggers"
     result = await hass.config_entries.options.async_configure(
@@ -1938,6 +1955,7 @@ async def test_options_flow_secure_video(hass: HomeAssistant) -> None:
     assert config_entry.options["entity_config"]["camera.front"] == {
         "secure_video": True,
         "linked_motion_sensor": "binary_sensor.front_motion",
+        "secure_video_prebuffer": prebuffer,
     }
 
     result = await hass.config_entries.options.async_init(config_entry.entry_id)
@@ -1958,7 +1976,8 @@ async def test_options_flow_secure_video(hass: HomeAssistant) -> None:
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert config_entry.options["entity_config"]["camera.front"] == {
-        "linked_motion_sensor": "binary_sensor.front_motion"
+        "linked_motion_sensor": "binary_sensor.front_motion",
+        "secure_video_prebuffer": prebuffer,
     }
 
 

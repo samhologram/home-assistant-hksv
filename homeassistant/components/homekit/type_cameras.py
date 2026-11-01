@@ -3,6 +3,7 @@
 import asyncio
 from datetime import timedelta
 import logging
+import shlex
 from typing import Any, override
 
 from haffmpeg.core import FFMPEG_STDERR, HAFFmpeg
@@ -45,6 +46,7 @@ from .const import (
     CONF_MAX_HEIGHT,
     CONF_MAX_WIDTH,
     CONF_SECURE_VIDEO,
+    CONF_SECURE_VIDEO_PREBUFFER,
     CONF_STREAM_ADDRESS,
     CONF_STREAM_COUNT,
     CONF_STREAM_SOURCE,
@@ -59,6 +61,7 @@ from .const import (
     DEFAULT_MAX_FPS,
     DEFAULT_MAX_HEIGHT,
     DEFAULT_MAX_WIDTH,
+    DEFAULT_SECURE_VIDEO_PREBUFFER,
     DEFAULT_STREAM_COUNT,
     DEFAULT_SUPPORT_AUDIO,
     DEFAULT_VIDEO_CODEC,
@@ -69,6 +72,8 @@ from .const import (
 )
 from .doorbell import HomeDoorbellAccessory
 from .hksv_controller import HKSVController
+from .hksv_hardware import HARDWARE_ENCODER_PROBE as _HARDWARE_PROBE
+from .hksv_stream import MediaObservation
 from .util import pid_is_alive, state_changed_event_is_same_state
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,8 +82,7 @@ _LOGGER = logging.getLogger(__name__)
 VIDEO_OUTPUT = (
     "-map {v_map} -an "
     "-c:v {v_codec} "
-    "{v_profile}"
-    "-tune zerolatency -pix_fmt yuv420p "
+    "{v_options}"
     "-r {fps} "
     "-b:v {v_max_bitrate}k -bufsize {v_bufsize}k -maxrate {v_max_bitrate}k "
     "-payload_type 99 "
@@ -125,6 +129,7 @@ FFMPEG_LOGGER = "ffmpeg_logger"
 FFMPEG_WATCHER = "ffmpeg_watcher"
 FFMPEG_PID = "ffmpeg_pid"
 FFMPEG_DIAGNOSTICS = "ffmpeg_diagnostics"
+FFMPEG_LIVE_HARDWARE = "ffmpeg_live_hardware"
 AUDIO_PROXY = "audio_proxy"
 SESSION_ID = "session_id"
 
@@ -142,6 +147,37 @@ CONFIG_DEFAULTS = {
     CONF_VIDEO_PACKET_SIZE: DEFAULT_VIDEO_PACKET_SIZE,
     CONF_STREAM_COUNT: DEFAULT_STREAM_COUNT,
 }
+
+
+def live_video_compatible(
+    observed: MediaObservation,
+    profile: int,
+    level: int,
+    width: int,
+    height: int,
+    fps: int,
+    max_bitrate: int,
+) -> bool:
+    """Check observed source video against a HomeKit live selection."""
+    profiles = (66, 77, 100)
+    levels = (31, 32, 40)
+    if profile not in range(len(profiles)) or level not in range(len(levels)):
+        return False
+    try:
+        source_profile = profiles.index(observed.h264_profile_idc)
+    except ValueError:
+        return False
+    return (
+        observed.video_codec == "h264"
+        and source_profile <= profile
+        and (source_profile != 0 or observed.h264_compatibility & 0x40 != 0)
+        and observed.h264_level_idc <= levels[level]
+        and observed.width == width
+        and observed.height == height
+        and 0 < observed.peak_fps <= fps
+        and 0 < observed.peak_video_bitrate <= max_bitrate * 1000
+        and observed.observation_seconds >= 2
+    )
 
 
 @TYPES.register("Camera")
@@ -269,6 +305,9 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                         self._hksv_sync_characteristics,
                         self._hksv_stop_live,
                         camera_entity_id=self.entity_id,
+                        prebuffer_seconds=self.config.get(
+                            CONF_SECURE_VIDEO_PREBUFFER, DEFAULT_SECURE_VIDEO_PREBUFFER
+                        ),
                     )
                 except Exception:
                     _LOGGER.exception(
@@ -390,7 +429,11 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 self._hksv.motion(True)
                 self._hksv.motion(False)
             char.set_value(True)
-            char.set_value(False)
+            if previous := getattr(self, "_motion_event_reset", None):
+                previous.cancel()
+            self._motion_event_reset = self.hass.loop.call_later(
+                1.0, char.set_value, False
+            )
             return
 
         detected = state == STATE_ON
@@ -447,20 +490,123 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         ):
             raise RuntimeError("HomeKit camera stream is disabled")
         _LOGGER.debug("[%s] Starting HomeKit live stream", session_info["id"])
+        if self._hksv:
+            profile_value = stream_config.get("v_profile_id")
+            level_value = stream_config.get("v_level")
+            _LOGGER.info(
+                "%s: HomeKit live selection profile=%s level=%s %sx%s fps=%s audio_rate=%s",
+                self.entity_id,
+                int.from_bytes(profile_value, "big")
+                if isinstance(profile_value, bytes)
+                else None,
+                int.from_bytes(level_value, "big")
+                if isinstance(level_value, bytes)
+                else None,
+                stream_config.get("width"),
+                stream_config.get("height"),
+                stream_config.get("fps"),
+                stream_config.get("a_sample_rate"),
+            )
         if not (input_source := await self._async_get_stream_source()):
             _LOGGER.error("Camera has no stream source")
             return False
         if "-i " not in input_source:
             input_source = "-i " + input_source
-        video_profile = ""
-        if self.config[CONF_VIDEO_CODEC] != "copy":
-            video_profile = (
+        video_codec = self.config[CONF_VIDEO_CODEC]
+        video_options = "-tune zerolatency -pix_fmt yuv420p "
+        if video_codec != "copy":
+            video_options = (
                 "-profile:v "
                 + self.config[CONF_VIDEO_PROFILE_NAMES][
                     int.from_bytes(stream_config["v_profile_id"], byteorder="big")
                 ]
-                + " "
+                + " -tune zerolatency -pix_fmt yuv420p "
             )
+        hardware = None
+        if self._hksv and video_codec == "copy":
+            try:
+                observed = await self._hksv.observe_live_source()
+            except Exception:  # noqa: BLE001 - optional inspection must not interrupt live
+                _LOGGER.warning(
+                    "%s: Could not inspect HomeKit live source", self.entity_id
+                )
+                observed = None
+            if observed is not None:
+                profile = int.from_bytes(stream_config["v_profile_id"], "big")
+                level = int.from_bytes(stream_config["v_level"], "big")
+                width, height, fps = (
+                    stream_config[key] for key in ("width", "height", "fps")
+                )
+                bitrate = stream_config["v_max_bitrate"]
+                if profile not in range(3) or level not in range(3):
+                    raise ValueError("Unsupported HomeKit live video parameters")
+                compatible = live_video_compatible(
+                    observed, profile, level, width, height, fps, bitrate
+                )
+                _LOGGER.info(
+                    "%s: HomeKit live source profile=%s level=%s %sx%s peak_fps=%s; selected profile=%s level=%s %sx%s fps=%s copy=%s audio_rate=%s",
+                    self.entity_id,
+                    observed.h264_profile_idc,
+                    observed.h264_level_idc,
+                    observed.width,
+                    observed.height,
+                    observed.peak_fps,
+                    profile,
+                    level,
+                    width,
+                    height,
+                    fps,
+                    compatible,
+                    stream_config.get("a_sample_rate"),
+                )
+                if not compatible:
+                    try:
+                        async with asyncio.timeout(4):
+                            hardware = await _HARDWARE_PROBE.select(
+                                self._ffmpeg.binary, profile, level, width, height, fps
+                            )
+                    except Exception:  # noqa: BLE001 - software fallback preserves live
+                        hardware = None
+                    video_codec = hardware.codec if hardware else "libx264"
+                    filters = (
+                        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+                    )
+                    if hardware:
+                        filters += f",{hardware.video_filter}"
+                        input_source = (
+                            shlex.join(hardware.global_args) + " " + input_source
+                        )
+                        video_options = (
+                            shlex.join(("-vf", filters, *hardware.output_args)) + " "
+                        )
+                    else:
+                        profiles = ("baseline", "main", "high")
+                        levels = ("3.1", "3.2", "4.0")
+                        video_options = (
+                            shlex.join(
+                                (
+                                    "-vf",
+                                    filters,
+                                    "-preset",
+                                    "veryfast",
+                                    "-tune",
+                                    "zerolatency",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    "-profile:v",
+                                    profiles[profile],
+                                    "-level:v",
+                                    levels[level],
+                                )
+                            )
+                            + " "
+                        )
+            else:
+                _LOGGER.info(
+                    "%s: HomeKit live source compatibility unavailable; configured copy retained",
+                    self.entity_id,
+                )
         audio_application = ""
         audio_frame_duration = ""
         if self.config[CONF_AUDIO_CODEC] == "libopus":
@@ -492,11 +638,11 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         output_vars = stream_config.copy()
         output_vars.update(
             {
-                "v_profile": video_profile,
+                "v_options": video_options,
                 "v_bufsize": stream_config["v_max_bitrate"] * 4,
                 "v_map": self.config[CONF_VIDEO_MAP],
                 "v_pkt_size": self.config[CONF_VIDEO_PACKET_SIZE],
-                "v_codec": self.config[CONF_VIDEO_CODEC],
+                "v_codec": video_codec,
                 "a_bufsize": stream_config["a_max_bitrate"] * 4,
                 "a_map": self.config[CONF_AUDIO_MAP],
                 "a_pkt_size": self.config[CONF_AUDIO_PACKET_SIZE],
@@ -506,6 +652,14 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 "a_proxy_port": audio_proxy.local_port if audio_proxy else 0,
             }
         )
+        if self._hksv and (
+            not self._hksv.privacy_ready
+            or not self._hksv.camera_active
+            or not self._hksv.stream_active(session_info["stream_idx"])
+        ):
+            if audio_proxy:
+                await audio_proxy.async_stop()
+            return False
         output = VIDEO_OUTPUT.format(**output_vars)
         if self.config[CONF_SUPPORT_AUDIO]:
             output = output + " " + AUDIO_OUTPUT.format(**output_vars)
@@ -532,6 +686,8 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
 
         session_info["stream"] = stream
         session_info[FFMPEG_PID] = stream.process.pid
+        if hardware is not None:
+            session_info[FFMPEG_LIVE_HARDWARE] = hardware.codec
         session_info[AUDIO_PROXY] = audio_proxy
 
         stderr_reader = await stream.get_reader(source=FFMPEG_STDERR)
@@ -618,6 +774,8 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             except TimeoutError:
                 pass
         diagnostics = sorted(session_info.get(FFMPEG_DIAGNOSTICS, ()))
+        if codec := session_info.pop(FFMPEG_LIVE_HARDWARE, None):
+            _HARDWARE_PROBE.report_failure(codec)
         stream = session_info.get("stream")
         exit_code = stream.process.returncode if stream is not None else None
         _LOGGER.warning(
@@ -642,6 +800,9 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
     @override
     def async_stop(self) -> None:
         """Stop any streams when the accessory is stopped."""
+        if motion_reset := getattr(self, "_motion_event_reset", None):
+            motion_reset.cancel()
+            del self._motion_event_reset
         for session_info in self.sessions.values():
             self.hass.async_create_background_task(
                 self.stop_stream(session_info), "homekit.camera-stop-stream"
