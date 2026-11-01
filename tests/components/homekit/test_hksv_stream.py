@@ -1,12 +1,16 @@
 """Tests for the dedicated HKSV shared stream output."""
 
+# Tests exercise internal stream muxing and timing behavior.
+# pylint: disable=home-assistant-component-root-import
+
 from fractions import Fraction
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 import shutil
 import subprocess
 from threading import Event
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import av
 import pytest
@@ -15,16 +19,14 @@ from homeassistant.components.homekit.hksv_stream import (
     SharedCameraStream,
     inspect_recording,
 )
-from homeassistant.components.stream.core import (  # pylint: disable=home-assistant-component-root-import
-    StreamSettings,
-)
-from homeassistant.components.stream.diagnostics import (  # pylint: disable=home-assistant-component-root-import
-    Diagnostics,
-)
-from homeassistant.components.stream.worker import (  # pylint: disable=home-assistant-component-root-import
+from homeassistant.components.stream.core import StreamSettings
+from homeassistant.components.stream.diagnostics import Diagnostics
+from homeassistant.components.stream.worker import (
     AudioTimestampNormalizer,
     StreamEndedError,
+    StreamMuxer,
     StreamState,
+    StreamWorkerError,
     stream_worker,
 )
 
@@ -263,18 +265,14 @@ def test_shared_worker_transcodes_alaw_only_when_requested(tmp_path: Path) -> No
                     assert abs(video_times[-1] - audio_times[-1]) < 0.3
 
 
-@pytest.mark.parametrize("requested", [False, True])
+@pytest.mark.parametrize(("requested", "expected_count"), [(False, 0), (True, 1)])
 def test_mux_failure_diagnostic_is_scoped_and_redacted(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, requested: bool
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    requested: bool,
+    expected_count: int,
 ) -> None:
     """Only the HKSV audio path logs packet metadata, without the source."""
-    from unittest.mock import patch  # noqa: PLC0415
-
-    from homeassistant.components.stream.worker import (  # noqa: PLC0415  # pylint: disable=home-assistant-component-root-import
-        StreamMuxer,
-        StreamWorkerError,
-    )
-
     if not (ffmpeg := shutil.which("ffmpeg")):
         pytest.skip("ffmpeg unavailable")
     path = tmp_path / "private-camera-secret.mkv"
@@ -320,14 +318,14 @@ def test_mux_failure_diagnostic_is_scoped_and_redacted(
     original = StreamMuxer.mux_packet
     count = 0
 
-    def fail_after_first(muxer, packet):
+    def fail_after_first(muxer: StreamMuxer, packet: av.Packet) -> None:
         nonlocal count
         count += 1
         if count == 2:
             raise av.FFmpegError(
                 22, "invalid input", "rtsp://user:private-secret@camera/stream"
             )
-        return original(muxer, packet)
+        original(muxer, packet)
 
     with (
         patch.object(StreamMuxer, "mux_packet", fail_after_first),
@@ -339,10 +337,10 @@ def test_mux_failure_diagnostic_is_scoped_and_redacted(
         for record in caplog.records
         if "HKSV shared mux failed" in record.message
     ]
-    if requested:
-        assert len(messages) == 1
+    assert len(messages) == expected_count
+    for message in messages:
         assert all(
-            label in messages[0]
+            label in message
             for label in (
                 "track=",
                 "dts=",
@@ -354,9 +352,7 @@ def test_mux_failure_diagnostic_is_scoped_and_redacted(
                 "errno=22",
             )
         )
-        assert "private" not in messages[0] and "rtsp" not in messages[0]
-    else:
-        assert messages == []
+        assert "private" not in message and "rtsp" not in message
 
 
 def test_audio_timestamps_clamp_overlap_and_preserve_gap() -> None:
@@ -371,3 +367,37 @@ def test_audio_timestamps_clamp_overlap_and_preserve_gap() -> None:
         clock.normalize(frame)
         actual.append(frame.pts)
     assert actual == [3130, 4154, 5178, 6202, 10000]
+
+
+def test_audio_timestamp_normalization_resamples_and_muxes_aac() -> None:
+    """Real overlapping source PTS become ordered AAC frames in an MP4."""
+    clock = AudioTimestampNormalizer()
+    resampler = av.audio.resampler.AudioResampler(  # pylint: disable=c-extension-no-member
+        format="fltp", layout="mono", rate=24000
+    )
+    output = BytesIO()
+    container = av.open(output, mode="w", format="mp4")
+    stream = container.add_stream("aac", rate=24000)
+    stream.layout = "mono"
+    converted_frames = []
+    for pts in (3130, 4154, 4170, 5194):
+        frame = av.AudioFrame(format="s16", layout="mono", samples=1024)
+        frame.sample_rate = 8000
+        frame.time_base = Fraction(1, 8000)
+        frame.pts = pts
+        clock.normalize(frame)
+        converted_frames.extend(resampler.resample(frame))
+    converted_frames.extend(resampler.resample(None))
+    for previous, current in pairwise(converted_frames):
+        assert previous.pts is not None and current.pts is not None
+        assert current.pts >= previous.pts + previous.samples
+    for frame in converted_frames:
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode(None):
+        container.mux(packet)
+    container.close()
+    output.seek(0)
+    with av.open(output, format="mp4") as result:
+        assert result.streams.audio[0].codec_context.name == "aac"
+        assert sum(1 for packet in result.demux(audio=0) if packet.dts is not None) > 0
