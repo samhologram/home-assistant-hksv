@@ -91,6 +91,7 @@ runs:
         version: ${{ inputs.apt-cache-version }}
         execute_install_scripts: true
     - name: Check out pinned HAP fork for HKSV
+      id: checkout-hksv-hap
       if: steps.cache-venv.outputs.cache-hit != 'true' && github.repository == 'samhologram/home-assistant-hksv'
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -117,6 +118,12 @@ runs:
           uv pip install -r requirements_all.txt -r requirements_test.txt
         fi
         uv pip install -e . --config-settings editable_mode=compat
+    - name: Remove temporary HAP checkout
+      if: always() && steps.checkout-hksv-hap.outcome != 'skipped' && github.repository == 'samhologram/home-assistant-hksv'
+      shell: bash
+      run: |
+        rm -rf .hksv-deps/HAP-python
+        rmdir .hksv-deps 2>/dev/null || true
     - name: Prune uv cache
       if: inputs.save == 'true' && steps.cache-venv.outputs.cache-hit != 'true'
       shell: bash
