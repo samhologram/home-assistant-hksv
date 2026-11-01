@@ -365,7 +365,7 @@ async def test_monitored_copy_stops_before_invalid_fragment(
             yield SharedFragment(1, 2, b"init", b"two", 4)
             yield SharedFragment(1, 3, b"init", b"bad", 4)
 
-    async def source(_with_audio: bool) -> None:
+    async def source() -> None:
         return None
 
     controller = hksv_controller.HKSVController(source, "ffmpeg", None)
@@ -412,7 +412,7 @@ async def test_native_probe_adds_supported_resolution(
 
     shared = Shared()
 
-    async def source(_with_audio: bool) -> Shared:
+    async def source() -> Shared:
         return shared
 
     controller = hksv_controller.HKSVController(source, "ffmpeg", None)
@@ -610,7 +610,7 @@ async def test_audio_violation_does_not_disable_video_copy(
             yield SharedFragment(1, 2, b"init", b"two", 4)
             yield SharedFragment(1, 3, b"init", b"three", 4)
 
-    async def source(_with_audio: bool) -> None:
+    async def source() -> None:
         return None
 
     controller = hksv_controller.HKSVController(source, "ffmpeg", None)

@@ -1217,3 +1217,106 @@ def test_add_stream_from_template_decoder_only_fallback() -> None:
         ((template,), {}),
         ((template,), {"opaque": True}),
     ]
+
+
+async def test_keyframe_fresh_request_does_not_return_cached_image(
+    hass: HomeAssistant,
+) -> None:
+    """A failed fresh decode returns no stale image, while default preserves cache."""
+    settings = StreamSettings(False, 1.5, 2, 3, 2)
+    converter = KeyFrameConverter(hass, settings, dynamic_stream_settings())
+    converter._image = b"old frame"
+    assert await converter.async_get_image() == b"old frame"
+    assert await converter.async_get_image(require_fresh=True) is None
+
+
+async def test_fresh_snapshots_wait_for_independent_keyframes(
+    hass: HomeAssistant,
+) -> None:
+    """Concurrent fresh requests do not both consume the same keyframe."""
+    converter = KeyFrameConverter(
+        hass, StreamSettings(False, 1.5, 2, 3, 2), dynamic_stream_settings()
+    )
+    frames = iter((b"one", b"two"))
+
+    def decode(_width, _height):
+        converter._image = next(frames)
+
+    with patch.object(converter, "_generate_image", side_effect=decode):
+        first = asyncio.create_task(
+            converter.async_get_image(wait_for_next_keyframe=True, require_fresh=True)
+        )
+        second = asyncio.create_task(
+            converter.async_get_image(wait_for_next_keyframe=True, require_fresh=True)
+        )
+        await asyncio.sleep(0)
+        converter._event.set()
+        assert await asyncio.wait_for(first, 2) == b"one"
+        await asyncio.sleep(0)
+        assert not second.done()
+        converter._event.set()
+        assert await asyncio.wait_for(second, 2) == b"two"
+
+
+async def test_keyframe_decoder_resets_on_new_source_generation(
+    hass: HomeAssistant,
+) -> None:
+    """A new source codec never reuses the prior decoder or cached frame."""
+    converter = KeyFrameConverter(
+        hass, StreamSettings(False, 1.5, 2, 3, 2), dynamic_stream_settings()
+    )
+    h264 = av.CodecContext.create("h264", "r")
+    hevc = av.CodecContext.create("hevc", "r")
+    converter.create_codec_context(h264)
+    previous = converter._codec_context
+    converter._image = b"old frame"
+    converter._packet = MagicMock()
+    converter.create_codec_context(hevc)
+    assert converter._codec_context is not previous
+    assert converter._codec_context.name == "hevc"
+    changed_hevc = av.CodecContext.create("hevc", "r")
+    changed_hevc.extradata = b"new codec parameters"
+    previous = converter._codec_context
+    converter.create_codec_context(changed_hevc)
+    assert converter._codec_context is not previous
+    assert converter._codec_context.extradata == b"new codec parameters"
+    assert converter._image == b"old frame"
+    assert await converter.async_get_image(require_fresh=True) is None
+    assert converter._packet is None
+
+
+async def test_keyframe_from_old_generation_is_discarded_without_blocking_worker(
+    hass: HomeAssistant,
+) -> None:
+    """A decoder switch can proceed while an older frame is being encoded."""
+    converter = KeyFrameConverter(
+        hass, StreamSettings(False, 1.5, 2, 3, 2), dynamic_stream_settings()
+    )
+    started, release = threading.Event(), threading.Event()
+    frame = MagicMock()
+    frame.to_ndarray.return_value = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    def decode(_packet):
+        started.set()
+        assert release.wait(3)
+        return [frame]
+
+    old_context = MagicMock()
+    old_context.decode.side_effect = decode
+    converter._codec_context = old_context
+    converter._packet = MagicMock()
+    converter._turbojpeg = MagicMock()
+    converter._turbojpeg.encode.return_value = b"old frame"
+    task = hass.async_add_executor_job(converter._generate_image, None, None)
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        async with asyncio.timeout(2):
+            await asyncio.to_thread(
+                converter.create_codec_context, av.CodecContext.create("h264", "r")
+            )
+        release.set()
+        await task
+        assert converter._image is None
+    finally:
+        release.set()
+        await task

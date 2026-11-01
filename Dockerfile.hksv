@@ -9,5 +9,6 @@ RUN uv pip install --system --no-deps /tmp/hksv/hap_python-5.0.0.post1-py3-none-
     && python3 -c "from importlib.metadata import version; assert version('HAP-python') == '5.0.0.post1'"
 
 COPY homeassistant/components/homekit/ /usr/src/homeassistant/homeassistant/components/homekit/
-COPY homeassistant/components/stream/worker.py /usr/src/homeassistant/homeassistant/components/stream/worker.py
+COPY homeassistant/components/stream/__init__.py homeassistant/components/stream/core.py homeassistant/components/stream/worker.py /usr/src/homeassistant/homeassistant/components/stream/
 RUN python3 -c "import json; p='/usr/src/homeassistant/homeassistant/components/homekit/translations/en.json'; assert 'camera_secure_video' in open(p).read()"
+RUN python3 -c "from inspect import signature; from homeassistant.components.stream import Stream; from homeassistant.components.stream.core import KeyFrameConverter; assert {'use_existing_stream', 'require_fresh'} <= set(signature(Stream.async_get_image).parameters); assert 'require_fresh' in signature(KeyFrameConverter.async_get_image).parameters; assert hasattr(Stream, 'is_running')"

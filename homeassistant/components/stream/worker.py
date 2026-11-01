@@ -817,27 +817,9 @@ def stream_worker(
                     f"Error demuxing stream ({redact_av_error_string(ex)})"
                 ) from ex
 
-            packet_details = (
-                (
-                    packet.stream.type,
-                    packet.dts,
-                    packet.pts,
-                    str(packet.time_base),
-                    packet.is_keyframe,
-                )
-                if transcode_audio
-                else None
-            )
             try:
                 muxer.mux_packet(packet)
             except av.FFmpegError as ex:
-                if packet_details is not None:
-                    _LOGGER.warning(
-                        "HKSV shared mux failed: track=%s dts=%s pts=%s time_base=%s keyframe=%s video_codec=%s audio_transcode=true errno=%s",
-                        *packet_details,
-                        video_stream.name,
-                        ex.errno,
-                    )
                 raise StreamWorkerError(
                     f"Error muxing stream ({redact_av_error_string(ex)})"
                 ) from ex

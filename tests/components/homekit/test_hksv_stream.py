@@ -3,6 +3,7 @@
 # Tests exercise internal stream muxing and timing behavior.
 # pylint: disable=home-assistant-component-root-import
 
+import asyncio
 from fractions import Fraction
 from io import BytesIO
 from itertools import pairwise
@@ -16,6 +17,7 @@ import av
 import pytest
 
 from homeassistant.components.homekit.hksv_stream import (
+    HKSVStreamOutput,
     SharedCameraStream,
     inspect_recording,
 )
@@ -24,9 +26,7 @@ from homeassistant.components.stream.diagnostics import Diagnostics
 from homeassistant.components.stream.worker import (
     AudioTimestampNormalizer,
     StreamEndedError,
-    StreamMuxer,
     StreamState,
-    StreamWorkerError,
     stream_worker,
 )
 
@@ -238,6 +238,120 @@ def test_shared_worker_transcodes_alaw_only_when_requested(tmp_path: Path) -> No
             stream_worker(str(path), {}, settings, state, Mock(), Event())
         segments = [segment for segment in output.segments if segment.complete]
         assert len(segments) >= 3
+        # A live consumer pipes one initialization followed by low-latency parts.
+        pipe_data = segments[0].init + b"".join(
+            part.data for segment in segments for part in segment.parts
+        )
+        piped = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-f",
+                "null",
+                "-",
+            ],
+            input=pipe_data,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert piped.returncode == 0
+        if requested:
+            opus = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    "pipe:0",
+                    "-map",
+                    "0:a:0",
+                    "-c:a",
+                    "libopus",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-f",
+                    "opus",
+                    "pipe:1",
+                ],
+                input=pipe_data,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            assert opus.returncode == 0
+            with av.open(BytesIO(opus.stdout), format="ogg") as audio:
+                assert audio.streams.audio[0].codec_context.name == "opus"
+            dual = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    "pipe:0",
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-tune",
+                    "zerolatency",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    "15",
+                    "-payload_type",
+                    "99",
+                    "-f",
+                    "rtp",
+                    "-srtp_out_suite",
+                    "AES_CM_128_HMAC_SHA1_80",
+                    "-srtp_out_params",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "srtp://127.0.0.1:45520?pkt_size=1316",
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "libopus",
+                    "-application",
+                    "lowdelay",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-b:a",
+                    "24k",
+                    "-bufsize",
+                    "96k",
+                    "-frame_duration",
+                    "20",
+                    "-payload_type",
+                    "110",
+                    "-f",
+                    "rtp",
+                    "rtp://127.0.0.1:45522?pkt_size=188",
+                ],
+                input=pipe_data,
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            assert dual.returncode == 0, dual.stderr.decode(errors="replace")
         for segment in segments:
             with av.open(
                 BytesIO(segment.init + segment.get_data()), format="mp4"
@@ -263,96 +377,6 @@ def test_shared_worker_transcodes_alaw_only_when_requested(tmp_path: Path) -> No
                     assert video_times and audio_times
                     assert abs(video_times[0] - audio_times[0]) < 0.3
                     assert abs(video_times[-1] - audio_times[-1]) < 0.3
-
-
-@pytest.mark.parametrize(("requested", "expected_count"), [(False, 0), (True, 1)])
-def test_mux_failure_diagnostic_is_scoped_and_redacted(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    requested: bool,
-    expected_count: int,
-) -> None:
-    """Only the HKSV audio path logs packet metadata, without the source."""
-    if not (ffmpeg := shutil.which("ffmpeg")):
-        pytest.skip("ffmpeg unavailable")
-    path = tmp_path / "private-camera-secret.mkv"
-    result = subprocess.run(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=320x240:rate=15",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=1000:sample_rate=8000",
-            "-t",
-            "5",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            "30",
-            "-c:a",
-            "pcm_alaw",
-            "-f",
-            "matroska",
-            "-y",
-            str(path),
-        ],
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode:
-        pytest.skip("ffmpeg test encoders unavailable")
-    output = Mock(requires_aac_audio=requested)
-    hass = Mock()
-    hass.loop.call_soon_threadsafe.side_effect = lambda callback, *args: callback(*args)
-    state = StreamState(hass, lambda: {"test": output}, Diagnostics())
-    settings = StreamSettings(False, 1.5, 2, 3, 2)
-    original = StreamMuxer.mux_packet
-    count = 0
-
-    def fail_after_first(muxer: StreamMuxer, packet: av.Packet) -> None:
-        nonlocal count
-        count += 1
-        if count == 2:
-            raise av.FFmpegError(
-                22, "invalid input", "rtsp://user:private-secret@camera/stream"
-            )
-        original(muxer, packet)
-
-    with (
-        patch.object(StreamMuxer, "mux_packet", fail_after_first),
-        pytest.raises(StreamWorkerError),
-    ):
-        stream_worker(str(path), {}, settings, state, Mock(), Event())
-    messages = [
-        record.message
-        for record in caplog.records
-        if "HKSV shared mux failed" in record.message
-    ]
-    assert len(messages) == expected_count
-    for message in messages:
-        assert all(
-            label in message
-            for label in (
-                "track=",
-                "dts=",
-                "pts=",
-                "time_base=",
-                "keyframe=",
-                "video_codec=h264",
-                "audio_transcode=true",
-                "errno=22",
-            )
-        )
-        assert "private" not in message and "rtsp" not in message
 
 
 def test_audio_timestamps_clamp_overlap_and_preserve_gap() -> None:
@@ -401,3 +425,217 @@ def test_audio_timestamp_normalization_resamples_and_muxes_aac() -> None:
     with av.open(output, format="mp4") as result:
         assert result.streams.audio[0].codec_context.name == "aac"
         assert sum(1 for packet in result.demux(audio=0) if packet.dts is not None) > 0
+
+
+async def test_shared_provider_is_reference_counted() -> None:
+    """Independent clients share one provider and release only their own lease."""
+    hass = Mock()
+    hass.data = {}
+    output = Mock()
+    stream = Mock()
+    stream.outputs.return_value = {"homekit_secure_video": output}
+    stream.remove_provider = AsyncMock()
+    owner = SharedCameraStream(stream, output)
+    with patch.object(
+        SharedCameraStream, "_open_owned", new_callable=AsyncMock, return_value=owner
+    ) as opener:
+        first, second, third = await asyncio.gather(
+            SharedCameraStream.open(hass, "camera.example"),
+            SharedCameraStream.open(hass, "camera.example"),
+            SharedCameraStream.open(hass, "camera.example"),
+        )
+        opener.assert_awaited_once()
+        await first.close()
+        await second.close()
+        stream.remove_provider.assert_not_awaited()
+        await third.close()
+        stream.remove_provider.assert_awaited_once_with(output)
+
+
+async def test_live_parts_start_at_keyframe_and_detect_generation_change() -> None:
+    """Each live reader receives low-latency parts and rejects discontinuities."""
+    output = Mock()
+    output.idle_timer = Mock()
+    output.part_recv = AsyncMock()
+    part0 = Mock(has_keyframe=True, data=b"part0")
+    part1 = Mock(has_keyframe=False, data=b"part1")
+    current = Mock(
+        stream_id=1, sequence=8, init=b"init", parts=[part0, part1], complete=False
+    )
+    output.get_segments.return_value = [current]
+    shared = SharedCameraStream(Mock(), output)
+    reader = shared.live_parts()
+    assert await anext(reader) == b"init"
+    assert await anext(reader) == b"part0"
+    assert await anext(reader) == b"part1"
+    output.get_segments.return_value = [Mock(stream_id=2)]
+    with pytest.raises(ValueError, match="generation changed"):
+        await anext(reader)
+    await reader.aclose()
+
+
+async def test_shared_snapshot_does_not_add_hls_provider() -> None:
+    """A snapshot uses the keyframe converter on its already-owned stream."""
+    stream = Mock()
+    stream.async_get_image = AsyncMock(return_value=b"jpeg")
+    shared = SharedCameraStream(stream, Mock())
+    assert await shared.image(640, 360) == b"jpeg"
+    stream.async_get_image.assert_awaited_once_with(
+        width=640,
+        height=360,
+        wait_for_next_keyframe=True,
+        use_existing_stream=True,
+        require_fresh=True,
+    )
+    stream.add_provider.assert_not_called()
+
+
+async def test_cancelled_lease_close_finishes_after_lock_released() -> None:
+    """Cancelling a caller waiting for the lock cannot leak its provider lease."""
+    hass = Mock()
+    hass.data = {}
+    output = Mock()
+    stream = Mock()
+    stream.outputs.return_value = {"homekit_secure_video": output}
+    stream.remove_provider = AsyncMock()
+    owner = SharedCameraStream(stream, output)
+    with patch.object(
+        SharedCameraStream, "_open_owned", new_callable=AsyncMock, return_value=owner
+    ):
+        lease = await SharedCameraStream.open(hass, "camera.test")
+        entry = lease._shared_entry
+        await entry.lock.acquire()
+        closing = asyncio.create_task(lease.close())
+        await asyncio.sleep(0)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        entry.lock.release()
+        await lease.close()
+        assert entry.references == 0
+        stream.remove_provider.assert_awaited_once_with(output)
+
+
+async def test_cancelled_last_close_finishes_provider_removal() -> None:
+    """Cancellation during provider removal cannot orphan its output."""
+    hass = Mock()
+    hass.data = {}
+    output = Mock()
+    stream = Mock()
+    stream.outputs.return_value = {"homekit_secure_video": output}
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def remove(_output):
+        entered.set()
+        await proceed.wait()
+
+    stream.remove_provider = AsyncMock(side_effect=remove)
+    owner = SharedCameraStream(stream, output)
+    with patch.object(
+        SharedCameraStream, "_open_owned", new_callable=AsyncMock, return_value=owner
+    ):
+        lease = await SharedCameraStream.open(hass, "camera.test")
+        closing = asyncio.create_task(lease.close())
+        await entered.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        proceed.set()
+        await lease.close()
+        assert lease._shared_entry.owner is None
+        stream.remove_provider.assert_awaited_once_with(output)
+
+
+async def test_detached_provider_is_recreated_for_new_lease() -> None:
+    """An output removed by the worker is never reused by a new consumer."""
+    hass = Mock()
+    hass.data = {}
+    old_output, new_output = Mock(), Mock()
+    stream = Mock()
+    outputs = {"homekit_secure_video": old_output}
+    stream.outputs.side_effect = lambda: outputs
+    stream.remove_provider = AsyncMock()
+    old_owner, new_owner = (
+        SharedCameraStream(stream, old_output),
+        SharedCameraStream(stream, new_output),
+    )
+    with patch.object(
+        SharedCameraStream,
+        "_open_owned",
+        new_callable=AsyncMock,
+        side_effect=[old_owner, new_owner],
+    ) as opener:
+        old_lease = await SharedCameraStream.open(hass, "camera.test")
+        outputs["homekit_secure_video"] = new_output
+        new_lease = await SharedCameraStream.open(hass, "camera.test")
+        assert opener.await_count == 2
+        with pytest.raises(ValueError, match="no longer attached"):
+            old_lease.snapshot()
+        await old_lease.close()
+        stream.remove_provider.assert_not_awaited()
+        await new_lease.close()
+        stream.remove_provider.assert_awaited_once_with(new_output)
+
+
+async def test_open_waiting_for_last_close_keeps_one_registry_entry() -> None:
+    """An opener waiting for removal cannot race into a second owner."""
+    hass = Mock()
+    hass.data = {}
+    stream = Mock()
+    output_a, output_b = Mock(), Mock()
+    outputs = {"homekit_secure_video": output_a}
+    stream.outputs.side_effect = outputs.copy
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    async def remove(output):
+        if output is output_a:
+            entered.set()
+            await proceed.wait()
+        outputs.pop("homekit_secure_video", None)
+
+    stream.remove_provider = AsyncMock(side_effect=remove)
+    first_owner, second_owner = (
+        SharedCameraStream(stream, output_a),
+        SharedCameraStream(stream, output_b),
+    )
+
+    async def create(*_args, **_kwargs):
+        if not outputs:
+            outputs["homekit_secure_video"] = output_b
+            return second_owner
+        return first_owner
+
+    with patch.object(SharedCameraStream, "_open_owned", side_effect=create):
+        first = await SharedCameraStream.open(hass, "camera.test")
+        closing = asyncio.create_task(first.close())
+        await entered.wait()
+        opening = asyncio.create_task(SharedCameraStream.open(hass, "camera.test"))
+        await asyncio.sleep(0)
+        proceed.set()
+        second = await opening
+        await closing
+        assert len(hass.data["homekit_shared_camera_streams"]) == 1
+        await second.close()
+        assert not hass.data["homekit_shared_camera_streams"]
+
+
+async def test_preloaded_worker_restarts_for_shared_audio() -> None:
+    """A running preloaded worker needs audio activation even without outputs."""
+    hass = Mock()
+    hass.data = {}
+    stream = Mock()
+    stream.is_running = True
+    stream.outputs.return_value = {}
+    stream.start = AsyncMock()
+    output = Mock(spec=HKSVStreamOutput)
+    stream.add_provider.return_value = output
+    camera = Mock(async_create_stream=AsyncMock(return_value=stream))
+    with patch(
+        "homeassistant.components.homekit.hksv_stream.get_camera_from_entity_id",
+        return_value=camera,
+    ):
+        lease = await SharedCameraStream.open(hass, "camera.preloaded")
+    stream.update_source.assert_called_once_with(stream.source)
+    assert output.requires_aac_audio
+    await lease.close()

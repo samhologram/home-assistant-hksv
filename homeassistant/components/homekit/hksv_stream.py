@@ -30,6 +30,7 @@ from homeassistant.core import HomeAssistant, callback
 _PROVIDER = "homekit_secure_video"
 _MAX_SEGMENTS = 8
 _MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+_SHARED_STREAMS = "homekit_shared_camera_streams"
 
 
 @PROVIDERS.register(_PROVIDER)
@@ -101,6 +102,29 @@ class SharedFragment:
     duration: float
 
 
+class _SharedEntry:
+    """Serialize acquisition and release across accessories for one entity."""
+
+    def __init__(self, entries: dict[str, _SharedEntry], entity_id: str) -> None:
+        """Initialize an empty provider entry."""
+        self.lock = asyncio.Lock()
+        self.owner: SharedCameraStream | None = None
+        self.references = 0
+        self.waiters = 0
+        self.entries = entries
+        self.entity_id = entity_id
+
+    def discard_if_unused(self) -> None:
+        """Remove the registry entry only when no owner, lease or opener remains."""
+        if (
+            self.references == 0
+            and self.waiters == 0
+            and self.owner is None
+            and self.entries.get(self.entity_id) is self
+        ):
+            del self.entries[self.entity_id]
+
+
 class SharedCameraStream:
     """Own a dedicated output on a Camera's existing shared stream."""
 
@@ -109,24 +133,50 @@ class SharedCameraStream:
         self._stream = stream
         self._output = output
         self._closed = False
+        self._shared_entry: _SharedEntry | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def open(
-        cls, hass: HomeAssistant, entity_id: str, *, with_audio: bool = False
+    async def open(cls, hass: HomeAssistant, entity_id: str) -> SharedCameraStream:
+        """Acquire a reference to the camera's shared output."""
+        entries = hass.data.setdefault(_SHARED_STREAMS, {})
+        entry = entries.setdefault(entity_id, _SharedEntry(entries, entity_id))
+        entry.waiters += 1
+        try:
+            async with entry.lock:
+                if entry.owner is not None and (
+                    entry.owner._closed or not entry.owner._attached()  # noqa: SLF001
+                ):
+                    await entry.owner.close()
+                    entry.owner = None
+                if entry.owner is None:
+                    # Keep audio available for later consumers without reconnecting.
+                    entry.owner = await cls._open_owned(hass, entity_id)
+                entry.references += 1
+                lease = cls(entry.owner._stream, entry.owner._output)  # noqa: SLF001
+                lease._shared_entry = entry
+                return lease
+        finally:
+            entry.waiters -= 1
+            entry.discard_if_unused()
+
+    @classmethod
+    async def _open_owned(
+        cls, hass: HomeAssistant, entity_id: str
     ) -> SharedCameraStream:
-        """Attach an HKSV output without opening another camera connection."""
+        """Attach the single shared output to the existing camera worker."""
         camera = get_camera_from_entity_id(hass, entity_id)
         stream = await camera.async_create_stream()
         if stream is None:
             raise ValueError("Camera has no stream")
         if _PROVIDER in stream.outputs():
             raise RuntimeError("Camera already has an HKSV stream owner")
-        had_outputs = bool(stream.outputs())
+        was_running = stream.is_running
         output = stream.add_provider(_PROVIDER, timeout=300)
         assert isinstance(output, HKSVStreamOutput)
-        output.requires_aac_audio = with_audio
+        output.requires_aac_audio = True
         try:
-            if had_outputs and with_audio:
+            if was_running:
                 stream.update_source(stream.source)
             await stream.start()
         except BaseException:
@@ -134,10 +184,19 @@ class SharedCameraStream:
             raise
         return cls(stream, output)
 
+    def _attached(self) -> bool:
+        """Return whether this output is still owned by the camera stream."""
+        return self._stream.outputs().get(_PROVIDER) is self._output
+
+    def _check_attached(self) -> None:
+        if self._shared_entry is not None and not self._attached():
+            raise ValueError("Shared camera output is no longer attached")
+
     def snapshot(
         self, cursor: tuple[int, int] | None = None
     ) -> tuple[SharedFragment, ...]:
         """Copy only complete new keyframe segments after checking their size."""
+        self._check_attached()
         self._output.idle_timer.awake()
         segments = tuple(self._output.get_segments())
         if not segments:
@@ -183,12 +242,85 @@ class SharedCameraStream:
             except TimeoutError:
                 pass
 
+    async def image(self, width: int, height: int) -> bytes | None:
+        """Decode a fresh keyframe from the shared source."""
+        self._check_attached()
+        image = await self._stream.async_get_image(
+            width=width,
+            height=height,
+            wait_for_next_keyframe=True,
+            use_existing_stream=True,
+            require_fresh=True,
+        )
+        self._check_attached()
+        return image
+
+    async def live_parts(self) -> AsyncIterator[bytes]:
+        """Yield initialization and low-latency parts, beginning at a keyframe."""
+        stream_id: int | None = None
+        sequence: int | None = None
+        part_index = 0
+        while not self._closed:
+            self._check_attached()
+            self._output.idle_timer.awake()
+            segments = tuple(self._output.get_segments())
+            if stream_id is None:
+                for segment in reversed(segments):
+                    if segment.parts and segment.parts[0].has_keyframe:
+                        stream_id, sequence = segment.stream_id, segment.sequence
+                        yield segment.init
+                        break
+            if stream_id is not None:
+                assert sequence is not None
+                if segments and segments[-1].stream_id != stream_id:
+                    raise ValueError("Camera stream generation changed")
+                current = next(
+                    (
+                        s
+                        for s in segments
+                        if s.sequence == sequence and s.stream_id == stream_id
+                    ),
+                    None,
+                )
+                if current is None:
+                    raise ValueError("Live consumer missed stream segments")
+                while part_index < len(current.parts):
+                    part = current.parts[part_index]
+                    if len(part.data) > _MAX_SNAPSHOT_BYTES:
+                        raise ValueError("Live fragment exceeds byte limit")
+                    part_index += 1
+                    yield part.data
+                if current.complete and any(
+                    s.sequence == sequence + 1 for s in segments
+                ):
+                    sequence += 1
+                    part_index = 0
+                    continue
+            try:
+                async with asyncio.timeout(1):
+                    await self._output.part_recv()
+            except TimeoutError:
+                pass
+
     async def close(self) -> None:
         """Detach only this provider, preserving other shared stream outputs."""
-        if self._closed:
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._finish_close())
+        await asyncio.shield(self._close_task)
+
+    async def _finish_close(self) -> None:
+        """Finish release even when the caller awaiting close is cancelled."""
+        if self._shared_entry is not None:
+            entry = self._shared_entry
+            async with entry.lock:
+                entry.references -= 1
+                if entry.references == 0 and entry.owner is not None:
+                    await entry.owner.close()
+                    entry.owner = None
+                entry.discard_if_unused()
             return
-        self._closed = True
-        if self._stream.outputs().get(_PROVIDER) is self._output:
+        if self._attached():
             await self._stream.remove_provider(self._output)
 
 

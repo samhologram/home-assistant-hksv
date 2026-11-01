@@ -28,6 +28,7 @@ from homeassistant.core import (
     State,
     callback,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
@@ -72,7 +73,7 @@ from .const import (
 )
 from .doorbell import HomeDoorbellAccessory
 from .hksv_controller import HKSVController
-from .hksv_hardware import HARDWARE_ENCODER_PROBE as _HARDWARE_PROBE
+from .hksv_hardware import HARDWARE_ENCODER_PROBE as _HARDWARE_PROBE, HardwareEncoder
 from .hksv_stream import MediaObservation
 from .util import pid_is_alive, state_changed_event_is_same_state
 
@@ -125,11 +126,14 @@ RESOLUTIONS = [
 ]
 
 FFMPEG_WATCH_INTERVAL = timedelta(seconds=5)
+SNAPSHOT_TIMEOUT = 15
 FFMPEG_LOGGER = "ffmpeg_logger"
 FFMPEG_WATCHER = "ffmpeg_watcher"
 FFMPEG_PID = "ffmpeg_pid"
 FFMPEG_DIAGNOSTICS = "ffmpeg_diagnostics"
 FFMPEG_LIVE_HARDWARE = "ffmpeg_live_hardware"
+FFMPEG_INPUT_TASK = "ffmpeg_input_task"
+FFMPEG_SHARED = "ffmpeg_shared"
 AUDIO_PROXY = "audio_proxy"
 SESSION_ID = "session_id"
 
@@ -455,14 +459,6 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
     def async_update_state(self, new_state: State | None) -> None:
         """Handle state change to update HomeKit value."""
 
-    async def _async_get_hksv_source(self, with_audio: bool) -> Any:
-        """Attach recording to the camera's shared Home Assistant stream."""
-        from .hksv_stream import SharedCameraStream  # noqa: PLC0415
-
-        return await SharedCameraStream.open(
-            self.hass, self.entity_id, with_audio=with_audio
-        )
-
     async def _async_get_stream_source(self) -> str | None:
         """Find the camera stream source url."""
         stream_source: str | None = self.config.get(CONF_STREAM_SOURCE)
@@ -479,15 +475,212 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             )
         return stream_source
 
+    async def _async_get_hksv_source(self) -> Any:
+        """Attach to the audio-capable shared Home Assistant stream."""
+        from .hksv_stream import SharedCameraStream  # noqa: PLC0415
+
+        if self.config.get(CONF_STREAM_SOURCE):
+            raise ValueError(
+                "Explicit stream_source cannot use the shared camera stream"
+            )
+        return await SharedCameraStream.open(self.hass, self.entity_id)
+
+    def _live_allowed(self, session_info: dict[str, Any]) -> bool:
+        """Apply the current operating and per-slot permissions."""
+        return self._hksv is None or (
+            self._hksv.privacy_ready
+            and self._hksv.camera_active
+            and self._hksv.stream_active(session_info["stream_idx"])
+        )
+
+    async def _live_video_parameters(
+        self, stream_config: dict[str, Any]
+    ) -> tuple[str, str, str, HardwareEncoder | None]:
+        """Choose a verified compatible video path for the selected stream."""
+        input_source = "-i pipe:0"
+        video_codec = self.config[CONF_VIDEO_CODEC]
+        profile = int.from_bytes(stream_config["v_profile_id"], "big")
+        level = int.from_bytes(stream_config["v_level"], "big")
+        width, height, fps = (stream_config[key] for key in ("width", "height", "fps"))
+        if profile not in range(3) or level not in range(3):
+            raise ValueError("Unsupported HomeKit live video parameters")
+        filters = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        )
+        if video_codec != "copy":
+            profile_name = self.config[CONF_VIDEO_PROFILE_NAMES][profile]
+            encoder_options = ["-vf", filters]
+            if video_codec == "libx264":
+                encoder_options += ["-preset", "veryfast"]
+            encoder_options += [
+                "-profile:v",
+                profile_name,
+                "-level:v",
+                ("3.1", "3.2", "4.0")[level],
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+            return input_source, video_codec, shlex.join(encoder_options) + " ", None
+        try:
+            observed = await self._hksv.observe_live_source() if self._hksv else None
+        except Exception:  # noqa: BLE001 - software fallback preserves live
+            _LOGGER.warning("%s: Could not inspect HomeKit live source", self.entity_id)
+            observed = None
+        if observed is not None and live_video_compatible(
+            observed, profile, level, width, height, fps, stream_config["v_max_bitrate"]
+        ):
+            return input_source, "copy", "-tune zerolatency -pix_fmt yuv420p ", None
+        try:
+            async with asyncio.timeout(4):
+                hardware = await _HARDWARE_PROBE.select(
+                    self._ffmpeg.binary, profile, level, width, height, fps
+                )
+        except Exception:  # noqa: BLE001 - software fallback preserves live
+            hardware = None
+        if hardware:
+            filters += f",{hardware.video_filter}"
+            input_source = shlex.join(hardware.global_args) + " " + input_source
+            options = shlex.join(("-vf", filters, *hardware.output_args)) + " "
+            return input_source, hardware.codec, options, hardware
+        options = (
+            shlex.join(
+                (
+                    "-vf",
+                    filters,
+                    "-preset",
+                    "veryfast",
+                    "-tune",
+                    "zerolatency",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-profile:v",
+                    ("baseline", "main", "high")[profile],
+                    "-level:v",
+                    ("3.1", "3.2", "4.0")[level],
+                )
+            )
+            + " "
+        )
+        return input_source, "libx264", options, None
+
+    def _live_audio_parameters(
+        self, stream_config: dict[str, Any]
+    ) -> tuple[str, str, str]:
+        """Encode the shared AAC/MP3 input to the advertised Opus codec."""
+        audio_codec = self.config[CONF_AUDIO_CODEC]
+        if audio_codec == "copy":
+            audio_codec = "libopus"
+        if audio_codec == "libopus":
+            return (
+                audio_codec,
+                "-application lowdelay ",
+                f"-frame_duration {stream_config.get('a_packet_time', 20)} ",
+            )
+        return audio_codec, "", ""
+
+    async def _direct_live_parameters(
+        self, stream_config: dict[str, Any]
+    ) -> tuple[str, str, str, str, str, str] | None:
+        """Prepare the configured direct stream using normal HomeKit behavior."""
+        if not (input_source := await self._async_get_stream_source()):
+            _LOGGER.error("Camera has no stream source")
+            return None
+        if "-i " not in input_source:
+            input_source = "-i " + input_source
+        video_codec = self.config[CONF_VIDEO_CODEC]
+        video_options = ""
+        if video_codec != "copy":
+            profile = int.from_bytes(stream_config["v_profile_id"], "big")
+            video_options = (
+                f"-profile:v {self.config[CONF_VIDEO_PROFILE_NAMES][profile]} "
+            )
+        video_options += "-tune zerolatency -pix_fmt yuv420p "
+        audio_codec = self.config[CONF_AUDIO_CODEC]
+        audio_application = audio_frame_duration = ""
+        if audio_codec == "libopus":
+            audio_application = "-application lowdelay "
+            audio_frame_duration = (
+                f"-frame_duration {stream_config.get('a_packet_time', 20)} "
+            )
+        return (
+            input_source,
+            video_codec,
+            video_options,
+            audio_codec,
+            audio_application,
+            audio_frame_duration,
+        )
+
+    async def _open_live_stream(
+        self,
+        session_info: dict[str, Any],
+        input_source: str,
+        output: str,
+        audio_proxy: AudioProxy | None,
+    ) -> tuple[HAFFmpeg, Any] | None:
+        """Acquire the optional shared input and open its live encoder."""
+        shared = None
+        if self._hksv:
+            try:
+                shared = await self._async_get_hksv_source()
+            except ValueError, RuntimeError, OSError, HomeAssistantError:
+                _LOGGER.warning(
+                    "%s: Shared camera source is unavailable", self.entity_id
+                )
+                if audio_proxy:
+                    await audio_proxy.async_stop()
+                return None
+            except BaseException:
+                if audio_proxy:
+                    await audio_proxy.async_stop()
+                raise
+            if not self._live_allowed(session_info):
+                await shared.close()
+                if audio_proxy:
+                    await audio_proxy.async_stop()
+                return None
+        stream = HAFFmpeg(self._ffmpeg.binary)
+        try:
+            opened = await stream.open(
+                cmd=[],
+                input_source=input_source,
+                output=output,
+                extra_cmd="-hide_banner -nostats",
+                stderr_pipe=True,
+                stdout_pipe=False,
+            )
+        except BaseException:
+            if shared:
+                await shared.close()
+            if audio_proxy:
+                await audio_proxy.async_stop()
+            raise
+        if not opened:
+            if shared:
+                await shared.close()
+            _LOGGER.error("Failed to open ffmpeg stream")
+            if audio_proxy:
+                await audio_proxy.async_stop()
+            return None
+
+        if not self._live_allowed(session_info):
+            await stream.close(timeout=1)
+            if shared:
+                await shared.close()
+            if audio_proxy:
+                await audio_proxy.async_stop()
+            return None
+
+        return stream, shared
+
     async def start_stream(
         self, session_info: dict[str, Any], stream_config: dict[str, Any]
     ) -> bool:
         """Start a new stream with the given configuration."""
-        if self._hksv and (
-            not self._hksv.privacy_ready
-            or not self._hksv.camera_active
-            or not self._hksv.stream_active(session_info["stream_idx"])
-        ):
+        if not self._live_allowed(session_info):
             raise RuntimeError("HomeKit camera stream is disabled")
         _LOGGER.debug("[%s] Starting HomeKit live stream", session_info["id"])
         if self._hksv:
@@ -507,113 +700,29 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 stream_config.get("fps"),
                 stream_config.get("a_sample_rate"),
             )
-        if not (input_source := await self._async_get_stream_source()):
-            _LOGGER.error("Camera has no stream source")
-            return False
-        if "-i " not in input_source:
-            input_source = "-i " + input_source
-        video_codec = self.config[CONF_VIDEO_CODEC]
-        video_options = "-tune zerolatency -pix_fmt yuv420p "
-        if video_codec != "copy":
-            video_options = (
-                "-profile:v "
-                + self.config[CONF_VIDEO_PROFILE_NAMES][
-                    int.from_bytes(stream_config["v_profile_id"], byteorder="big")
-                ]
-                + " -tune zerolatency -pix_fmt yuv420p "
+        if self._hksv:
+            (
+                input_source,
+                video_codec,
+                video_options,
+                hardware,
+            ) = await self._live_video_parameters(stream_config)
+            audio_codec, audio_application, audio_frame_duration = (
+                self._live_audio_parameters(stream_config)
             )
-        hardware = None
-        if self._hksv and video_codec == "copy":
-            try:
-                observed = await self._hksv.observe_live_source()
-            except Exception:  # noqa: BLE001 - optional inspection must not interrupt live
-                _LOGGER.warning(
-                    "%s: Could not inspect HomeKit live source", self.entity_id
-                )
-                observed = None
-            if observed is not None:
-                profile = int.from_bytes(stream_config["v_profile_id"], "big")
-                level = int.from_bytes(stream_config["v_level"], "big")
-                width, height, fps = (
-                    stream_config[key] for key in ("width", "height", "fps")
-                )
-                bitrate = stream_config["v_max_bitrate"]
-                if profile not in range(3) or level not in range(3):
-                    raise ValueError("Unsupported HomeKit live video parameters")
-                compatible = live_video_compatible(
-                    observed, profile, level, width, height, fps, bitrate
-                )
-                _LOGGER.info(
-                    "%s: HomeKit live source profile=%s level=%s %sx%s peak_fps=%s; selected profile=%s level=%s %sx%s fps=%s copy=%s audio_rate=%s",
-                    self.entity_id,
-                    observed.h264_profile_idc,
-                    observed.h264_level_idc,
-                    observed.width,
-                    observed.height,
-                    observed.peak_fps,
-                    profile,
-                    level,
-                    width,
-                    height,
-                    fps,
-                    compatible,
-                    stream_config.get("a_sample_rate"),
-                )
-                if not compatible:
-                    try:
-                        async with asyncio.timeout(4):
-                            hardware = await _HARDWARE_PROBE.select(
-                                self._ffmpeg.binary, profile, level, width, height, fps
-                            )
-                    except Exception:  # noqa: BLE001 - software fallback preserves live
-                        hardware = None
-                    video_codec = hardware.codec if hardware else "libx264"
-                    filters = (
-                        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-                    )
-                    if hardware:
-                        filters += f",{hardware.video_filter}"
-                        input_source = (
-                            shlex.join(hardware.global_args) + " " + input_source
-                        )
-                        video_options = (
-                            shlex.join(("-vf", filters, *hardware.output_args)) + " "
-                        )
-                    else:
-                        profiles = ("baseline", "main", "high")
-                        levels = ("3.1", "3.2", "4.0")
-                        video_options = (
-                            shlex.join(
-                                (
-                                    "-vf",
-                                    filters,
-                                    "-preset",
-                                    "veryfast",
-                                    "-tune",
-                                    "zerolatency",
-                                    "-pix_fmt",
-                                    "yuv420p",
-                                    "-profile:v",
-                                    profiles[profile],
-                                    "-level:v",
-                                    levels[level],
-                                )
-                            )
-                            + " "
-                        )
-            else:
-                _LOGGER.info(
-                    "%s: HomeKit live source compatibility unavailable; configured copy retained",
-                    self.entity_id,
-                )
-        audio_application = ""
-        audio_frame_duration = ""
-        if self.config[CONF_AUDIO_CODEC] == "libopus":
-            audio_application = "-application lowdelay "
-            audio_frame_duration = (
-                f"-frame_duration {stream_config.get('a_packet_time', 20)} "
-            )
+        else:
+            parameters = await self._direct_live_parameters(stream_config)
+            if parameters is None:
+                return False
+            (
+                input_source,
+                video_codec,
+                video_options,
+                audio_codec,
+                audio_application,
+                audio_frame_duration,
+            ) = parameters
+            hardware = None
         # Start audio proxy to convert Opus RTP timestamps from 48kHz
         # (FFmpeg's hardcoded Opus RTP clock rate per RFC 7587) to the
         # sample rate negotiated by HomeKit (typically 16kHz).
@@ -646,37 +755,25 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 "a_bufsize": stream_config["a_max_bitrate"] * 4,
                 "a_map": self.config[CONF_AUDIO_MAP],
                 "a_pkt_size": self.config[CONF_AUDIO_PACKET_SIZE],
-                "a_encoder": self.config[CONF_AUDIO_CODEC],
+                "a_encoder": audio_codec,
                 "a_application": audio_application,
                 "a_frame_duration": audio_frame_duration,
                 "a_proxy_port": audio_proxy.local_port if audio_proxy else 0,
             }
         )
-        if self._hksv and (
-            not self._hksv.privacy_ready
-            or not self._hksv.camera_active
-            or not self._hksv.stream_active(session_info["stream_idx"])
-        ):
+        if not self._live_allowed(session_info):
             if audio_proxy:
                 await audio_proxy.async_stop()
             return False
         output = VIDEO_OUTPUT.format(**output_vars)
         if self.config[CONF_SUPPORT_AUDIO]:
             output = output + " " + AUDIO_OUTPUT.format(**output_vars)
-        stream = HAFFmpeg(self._ffmpeg.binary)
-        opened = await stream.open(
-            cmd=[],
-            input_source=input_source,
-            output=output,
-            extra_cmd="-hide_banner -nostats",
-            stderr_pipe=True,
-            stdout_pipe=False,
+        opened = await self._open_live_stream(
+            session_info, input_source, output, audio_proxy
         )
-        if not opened:
-            _LOGGER.error("Failed to open ffmpeg stream")
-            if audio_proxy:
-                await audio_proxy.async_stop()
+        if opened is None:
             return False
+        stream, shared = opened
 
         _LOGGER.debug(
             "[%s] Started stream process - PID %d",
@@ -686,11 +783,24 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
 
         session_info["stream"] = stream
         session_info[FFMPEG_PID] = stream.process.pid
+        if shared:
+            session_info[FFMPEG_SHARED] = shared
+            session_info[FFMPEG_INPUT_TASK] = create_eager_task(
+                self._feed_shared_live(stream, shared)
+            )
         if hardware is not None:
             session_info[FFMPEG_LIVE_HARDWARE] = hardware.codec
         session_info[AUDIO_PROXY] = audio_proxy
 
-        stderr_reader = await stream.get_reader(source=FFMPEG_STDERR)
+        try:
+            stderr_reader = await stream.get_reader(source=FFMPEG_STDERR)
+        except BaseException:
+            await self._release_shared_live(session_info)
+            await stream.close(timeout=1)
+            if audio_proxy:
+                await audio_proxy.async_stop()
+                session_info.pop(AUDIO_PROXY, None)
+            raise
 
         async def watch_session(_: Any) -> None:
             await self._async_ffmpeg_watch(session_info["id"])
@@ -705,6 +815,28 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
         )
 
         return await self._async_ffmpeg_watch(session_info["id"])
+
+    async def _feed_shared_live(self, stream: HAFFmpeg, shared: Any) -> None:
+        """Feed bounded shared parts to this session's FFmpeg process."""
+        process = stream.process
+        try:
+            async for chunk in shared.live_parts():
+                process.stdin.write(chunk)
+                async with asyncio.timeout(5):
+                    await process.stdin.drain()
+        except BrokenPipeError, ConnectionError, TimeoutError, ValueError:
+            _LOGGER.warning("%s: Shared live stream interrupted", self.entity_id)
+        finally:
+            if process and process.stdin:
+                process.stdin.close()
+
+    async def _release_shared_live(self, session_info: dict[str, Any]) -> None:
+        """Release the session input independently from recording."""
+        if task := session_info.pop(FFMPEG_INPUT_TASK, None):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if shared := session_info.pop(FFMPEG_SHARED, None):
+            await shared.close()
 
     async def _async_log_stderr_stream(
         self, stderr_reader: asyncio.StreamReader, session_info: dict[str, Any]
@@ -785,6 +917,9 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             diagnostics or ["unclassified"],
         )
         self._async_stop_ffmpeg_watch(session_id)
+        await self._release_shared_live(session_info)
+        if proxy := session_info.pop(AUDIO_PROXY, None):
+            await proxy.async_stop()
         self.set_streaming_available(session_info["stream_idx"])
         return False
 
@@ -819,6 +954,8 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
     async def stop_stream(self, session_info: dict[str, Any]) -> None:
         """Stop the stream for the given ``session_id``."""
         session_id = session_info["id"]
+        shared_input = FFMPEG_SHARED in session_info
+        await self._release_shared_live(session_info)
         if proxy := session_info.pop(AUDIO_PROXY, None):
             await proxy.async_stop()
 
@@ -832,16 +969,32 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
             _LOGGER.warning("[%s] Stream already stopped", session_id)
             return
 
-        for shutdown_method in ("close", "kill"):
-            _LOGGER.debug("[%s] %s stream", session_id, shutdown_method)
+        if not shared_input:
+            for shutdown_method in ("close", "kill"):
+                try:
+                    await getattr(stream, shutdown_method)()
+                except Exception:
+                    _LOGGER.exception(
+                        "[%s] Failed to %s stream", session_id, shutdown_method
+                    )
+                else:
+                    return
+            return
+
+        process = stream.process
+        try:
+            async with asyncio.timeout(3):
+                await process.wait()
+        except TimeoutError:
             try:
-                await getattr(stream, shutdown_method)()
-            except Exception:
-                _LOGGER.exception(
-                    "[%s] Failed to %s stream", session_id, shutdown_method
-                )
-            else:
-                return
+                process.terminate()
+                async with asyncio.timeout(2):
+                    await process.wait()
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+            except ProcessLookupError:
+                pass
 
     async def reconfigure_stream(
         self, session_info: dict[str, Any], stream_config: dict[str, Any]
@@ -851,15 +1004,29 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
 
     async def async_get_snapshot(self, image_size: dict[str, int]) -> bytes:
         """Return a jpeg of a snapshot from the camera."""
+        if self._hksv is None:
+            image = await camera.async_get_image(
+                self.hass,
+                self.entity_id,
+                width=image_size["image-width"],
+                height=image_size["image-height"],
+            )
+            return image.content
         if self._hksv and not self._hksv.snapshot_allowed(image_size.get("reason")):
             reason = image_size.get("reason")
             raise HAPStatusError(
                 -70401 if reason is None and self._hksv.camera_active else -70412
             )
-        image = await camera.async_get_image(
-            self.hass,
-            self.entity_id,
-            width=image_size["image-width"],
-            height=image_size["image-height"],
-        )
-        return image.content
+        async with asyncio.timeout(SNAPSHOT_TIMEOUT):
+            shared = await self._async_get_hksv_source()
+            try:
+                image = await shared.image(
+                    image_size["image-width"], image_size["image-height"]
+                )
+            finally:
+                await shared.close()
+        if self._hksv and not self._hksv.snapshot_allowed(image_size.get("reason")):
+            raise HAPStatusError(-70412)
+        if image is None:
+            raise HAPStatusError(-70402)
+        return image

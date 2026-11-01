@@ -67,7 +67,7 @@ def test_session_and_lifecycle() -> None:
     """Session setup and cleanup preserve state."""
 
     async def run():
-        async def source(_with_audio: bool):
+        async def source():
             return None
 
         store = Store()
@@ -96,7 +96,7 @@ def test_encoder_failure_is_bounded_and_unstarted_stream_not_reserved() -> None:
     """Failures retry only within the configured bound."""
 
     async def run():
-        async def source(_with_audio: bool):
+        async def source():
             return None
 
         ctl = c.HKSVController(source, "ffmpeg", Store())
@@ -145,7 +145,7 @@ def test_encoder_failure_is_bounded_and_unstarted_stream_not_reserved() -> None:
 def test_snapshot_permissions() -> None:
     """Snapshot requests follow operating permissions."""
 
-    async def source(_with_audio: bool):
+    async def source():
         return None
 
     controller = c.HKSVController(source, "ffmpeg", Store())
@@ -168,7 +168,7 @@ def test_snapshot_permissions() -> None:
 def test_writes_fail_closed_before_state_load() -> None:
     """Reject writes before restoring privacy state."""
 
-    async def source(_with_audio: bool):
+    async def source():
         return None
 
     controller = c.HKSVController(source, "ffmpeg", Store())
@@ -198,7 +198,7 @@ def test_shared_source_attached_and_detached() -> None:
 
         shared = Shared()
 
-        async def source(_with_audio: bool):
+        async def source():
             return shared
 
         class Process:
@@ -228,6 +228,7 @@ def test_shared_source_attached_and_detached() -> None:
         )
         with (
             patch.object(c, "RecordingProcess", Process),
+            patch.object(ctl, "_probe_copy", return_value=(False, False)),
             patch.object(
                 c._HARDWARE_PROBE, "select", new_callable=AsyncMock, return_value=None
             ),
@@ -250,7 +251,7 @@ async def test_hardware_failure_switches_to_software(
 ) -> None:
     """Quarantine a failed device and schedule a software restart."""
 
-    async def source(_with_audio: bool):
+    async def source():
         return None
 
     class FailedProcess:
@@ -308,7 +309,7 @@ async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
         async def close(self) -> None:
             return None
 
-    async def source(_with_audio: bool):
+    async def source():
         return Shared()
 
     def command(*_args, hardware=None, **_kwargs):
@@ -347,6 +348,9 @@ async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
     monkeypatch.setattr(c.asyncio, "sleep", fast_sleep)
     controller = c.HKSVController(source, "ffmpeg", Store())
     controller.hds = HDS()
+    monkeypatch.setattr(
+        controller, "_probe_copy", AsyncMock(return_value=(False, False))
+    )
     controller._ready = True
     controller.active = True
     controller.configuration = RecordingConfiguration(
@@ -366,7 +370,7 @@ async def test_hardware_runtime_failure_restarts_shared_stream_in_software(
 def test_selected_prebuffer_capability(seconds: int, milliseconds: int) -> None:
     """Advertise the selected recording pre-roll without starting a process."""
 
-    async def source(_with_audio: bool):
+    async def source():
         return None
 
     controller = c.HKSVController(source, "ffmpeg", Store(), prebuffer_seconds=seconds)
@@ -378,7 +382,7 @@ def test_selected_prebuffer_capability(seconds: int, milliseconds: int) -> None:
 def test_invalid_prebuffer_rejected() -> None:
     """Unsupported pre-roll values cannot be advertised."""
 
-    async def source(_with_audio: bool):
+    async def source():
         return None
 
     with pytest.raises(ValueError, match="prebuffer"):
@@ -390,7 +394,7 @@ async def test_recording_request_counts_and_safe_logging(
 ) -> None:
     """Count delegated requests and label completion without claiming an ACK."""
 
-    async def source(_with_audio: bool) -> None:
+    async def source() -> None:
         return None
 
     class Process:
@@ -419,8 +423,8 @@ async def test_recording_request_counts_and_safe_logging(
         (b"media", True),
     ]
     assert controller._hds_accepted == 1
-    assert controller._hds_completed == 1
-    assert "acknowledgement not observed by delegate" in caplog.text
+    assert controller._hds_final_offered == 1
+    assert "delivery and acknowledgement not observed by delegate" in caplog.text
     assert "media" not in caplog.text
 
 
@@ -430,7 +434,7 @@ async def test_restored_recording_waits_for_native_discovery() -> None:
     finish_discovery = asyncio.Event()
     acquisitions = []
 
-    async def source(_with_audio: bool):
+    async def source():
         raise AssertionError("the stubbed reconciliation must own acquisition")
 
     store = Store()
@@ -463,3 +467,32 @@ async def test_restored_recording_waits_for_native_discovery() -> None:
         await controller._reconcile_task
         assert acquisitions == ["probe-open", "probe-close", "recording-open"]
     await controller.close()
+
+
+async def test_final_fragment_is_counted_when_transport_closes_generator(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The HDS consumer closes after the last yield without resuming producer."""
+    from pyhap.datastream import HDSServer  # noqa: PLC0415
+
+    async def source() -> None:
+        return None
+
+    class Process:
+        async def fragments(self) -> AsyncIterator[bytes]:
+            yield b"initialization"
+            yield b"media"
+
+    controller = c.HKSVController(
+        source, "ffmpeg", Store(), camera_entity_id="camera.test"
+    )
+    controller.active = False
+    caplog.set_level(logging.INFO, logger=c.__name__)
+    send = AsyncMock()
+    assert await HDSServer._send_fragments(send, 7, controller._recording(Process()))
+    assert controller._hds_final_offered == 1
+    assert controller._hds_interrupted == 0
+    assert not controller._stream_active
+    assert "final fragment offered to transport" in caplog.text
+    assert "delivery and acknowledgement not observed by delegate" in caplog.text
+    assert "producer interrupted" not in caplog.text

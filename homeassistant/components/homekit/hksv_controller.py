@@ -40,7 +40,7 @@ class HKSVController:
 
     def __init__(
         self,
-        source: Callable[[bool], Awaitable[Any]],
+        source: Callable[[], Awaitable[SharedCameraStream | None]],
         ffmpeg: str,
         store: Any,
         on_camera_disabled: Callable[[], None] | None = None,
@@ -122,7 +122,7 @@ class HKSVController:
         self._stream_active = False
         self._hds_accepted = 0
         self._hds_rejected = 0
-        self._hds_completed = 0
+        self._hds_final_offered = 0
         self._hds_interrupted = 0
         self._motion_until = 0.0
         self._motion_detected = False
@@ -312,8 +312,8 @@ class HKSVController:
         shared = None
         try:
             async with asyncio.timeout(12):
-                shared = await self.source(False)
-                if shared is None or not hasattr(shared, "snapshot"):
+                shared = await self.source()
+                if shared is None:
                     return
                 while not self._closed:
                     fragments = shared.snapshot()
@@ -372,7 +372,7 @@ class HKSVController:
                 shared = None
                 process = None
                 try:
-                    shared = await self.source(desired[1])
+                    shared = await self.source()
                     if shared is None:
                         raise RuntimeError("camera has no shared stream")  # noqa: TRY301
                     copy_video, copy_audio = await self._probe_copy(
@@ -472,8 +472,6 @@ class HKSVController:
         audio_enabled: bool,
     ) -> tuple[bool, bool]:
         """Select each track independently after observing a compatible window."""
-        if not hasattr(shared, "snapshot"):
-            return False, False
         deadline = time.monotonic() + 10
         while not self._closed and time.monotonic() < deadline:
             fragments = shared.snapshot()
@@ -628,16 +626,17 @@ class HKSVController:
                     )
                     or time.monotonic() - start >= 60
                 )
-                yield fragment, last
                 if last:
                     completed = True
-                    self._hds_completed += 1
+                    self._hds_final_offered += 1
                     _LOGGER.info(
-                        "%s: Secure Video final fragment handed to transport fragments=%s total_completed=%s; acknowledgement not observed by delegate",
+                        "%s: Secure Video final fragment offered to transport fragments=%s total_final_offered=%s; delivery and acknowledgement not observed by delegate",
                         self.camera_entity_id,
                         media_fragments,
-                        self._hds_completed,
+                        self._hds_final_offered,
                     )
+                yield fragment, last
+                if last:
                     return
         finally:
             self._stream_active = False

@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
 from pyhap.hap_handler import HAPStatusError
@@ -151,18 +151,19 @@ async def test_live_and_snapshot_available_while_hksv_probes(
         patch.object(controller, "_discover_native", new=probe),
         patch.object(controller.hds, "start", new=AsyncMock()),
         patch.object(
-            accessory, "_async_get_stream_source", new=AsyncMock(return_value=None)
-        ),
-        patch(
-            "homeassistant.components.homekit.type_cameras.camera.async_get_image",
-            new=AsyncMock(return_value=SimpleNamespace(content=b"jpeg")),
+            accessory,
+            "_async_get_hksv_source",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    image=AsyncMock(return_value=b"jpeg"), close=AsyncMock()
+                )
+            ),
         ),
     ):
         task = asyncio.create_task(controller.start())
         try:
             await asyncio.wait_for(entered.wait(), 2)
             assert controller.privacy_ready and not controller.ready
-            assert await accessory.start_stream(request, {}) is False
             assert (
                 await accessory.async_get_snapshot(
                     {"image-width": 640, "image-height": 360}
@@ -185,7 +186,7 @@ async def test_live_and_snapshot_available_while_hksv_probes(
 async def test_explicit_stream_source_disables_hksv_only(
     hass: HomeAssistant, run_driver, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Keep the live source when an explicit override prevents shared HKSV."""
+    """Reject an override that cannot share the camera entity's stream."""
     await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
     hass.states.async_set("camera.demo_camera", "idle")
     source = "rtsp://example.invalid/live"
@@ -203,7 +204,8 @@ async def test_explicit_stream_source_disables_hksv_only(
     )
     assert accessory._hksv is None
     assert accessory._management
-    assert await accessory._async_get_stream_source() == source
+    with pytest.raises(ValueError, match="Explicit stream_source"):
+        await accessory._async_get_hksv_source()
     assert "Secure Video is unavailable with an explicit stream source" in caplog.text
 
 
@@ -340,7 +342,17 @@ async def test_secure_video_live_uses_codec_matching_negotiation(
     }
     reader = asyncio.StreamReader()
     reader.feed_eof()
-    process = SimpleNamespace(pid=12345, returncode=None)
+    process = SimpleNamespace(
+        pid=12345,
+        returncode=None,
+        stdin=SimpleNamespace(write=MagicMock(), drain=AsyncMock(), close=MagicMock()),
+    )
+
+    async def empty_parts():
+        await asyncio.Event().wait()
+        yield b""
+
+    shared = SimpleNamespace(live_parts=empty_parts, close=AsyncMock())
     ffmpeg_process = SimpleNamespace(
         process=process,
         open=AsyncMock(return_value=True),
@@ -348,7 +360,7 @@ async def test_secure_video_live_uses_codec_matching_negotiation(
     )
     with (
         patch.object(
-            accessory, "_async_get_stream_source", AsyncMock(return_value="/dev/null")
+            accessory, "_async_get_hksv_source", AsyncMock(return_value=shared)
         ),
         patch(
             "homeassistant.components.homekit.type_cameras.HAFFmpeg",
@@ -375,6 +387,7 @@ async def test_secure_video_live_uses_codec_matching_negotiation(
         else:
             assert "scale=" not in output
         accessory._async_stop_ffmpeg_watch("live-test")
+        await accessory._release_shared_live(session)
     accessory.sessions.clear()
 
 
@@ -411,12 +424,398 @@ async def test_live_permission_rechecked_after_media_observation(
         "v_ssrc": 12345,
     }
     with (
-        patch.object(
-            accessory, "_async_get_stream_source", AsyncMock(return_value="/dev/null")
-        ),
         patch(
             "homeassistant.components.homekit.type_cameras.HAFFmpeg"
         ) as ffmpeg_factory,
     ):
         assert not await accessory.start_stream(session, selection)
         ffmpeg_factory.assert_not_called()
+
+
+async def test_shared_live_and_snapshot_privacy(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """Live and snapshots use the shared source and release their own leases."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    accessory._hksv = SimpleNamespace(
+        privacy_ready=True,
+        camera_active=True,
+        stream_active=lambda _index: True,
+        snapshot_allowed=lambda _reason: accessory._hksv.camera_active,
+    )
+    writer = SimpleNamespace(write=MagicMock(), drain=AsyncMock(), close=MagicMock())
+    process = SimpleNamespace(pid=12345, returncode=None, stdin=writer)
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+    ffmpeg_process = SimpleNamespace(
+        process=process,
+        open=AsyncMock(return_value=True),
+        get_reader=AsyncMock(return_value=reader),
+    )
+    delivered = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def parts():
+        yield b"initialization"
+        yield b"media"
+        delivered.set()
+        await hold.wait()
+
+    shared = SimpleNamespace(
+        live_parts=parts, image=AsyncMock(return_value=b"jpeg"), close=AsyncMock()
+    )
+    selection = {
+        "v_profile_id": b"\x02",
+        "v_level": b"\x02",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "v_max_bitrate": 1500,
+        "a_max_bitrate": 32,
+        "address": "127.0.0.1",
+        "v_port": 12345,
+        "v_srtp_key": "synthetic",
+        "v_ssrc": 12345,
+    }
+    session = {"id": "shared", "stream_idx": 0}
+    accessory.sessions["shared"] = session
+    with (
+        patch.object(
+            accessory, "_async_get_hksv_source", AsyncMock(return_value=shared)
+        ),
+        patch(
+            "homeassistant.components.homekit.type_cameras.HAFFmpeg",
+            return_value=ffmpeg_process,
+        ),
+        patch.object(accessory, "_async_ffmpeg_watch", AsyncMock(return_value=True)),
+    ):
+        assert await accessory.start_stream(session, selection)
+        await asyncio.wait_for(delivered.wait(), 2)
+        assert ffmpeg_process.open.call_args.kwargs["input_source"] == "-i pipe:0"
+        assert writer.write.call_args_list == [call(b"initialization"), call(b"media")]
+        assert (
+            await accessory.async_get_snapshot(
+                {"image-width": 640, "image-height": 360}
+            )
+            == b"jpeg"
+        )
+        shared.close.assert_awaited_once()
+        await accessory._release_shared_live(session)
+        assert shared.close.await_count == 2
+        accessory._async_stop_ffmpeg_watch("shared")
+    accessory.sessions.clear()
+
+
+async def test_shared_live_privacy_change_releases_reference(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A privacy change while acquiring the shared stream prevents FFmpeg startup."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    status = SimpleNamespace(
+        privacy_ready=True,
+        camera_active=True,
+        stream_active=lambda _index: True,
+    )
+    accessory._hksv = status
+    shared = SimpleNamespace(close=AsyncMock())
+
+    async def acquire():
+        status.camera_active = False
+        return shared
+
+    selection = {
+        "v_profile_id": b"\x02",
+        "v_level": b"\x02",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "v_max_bitrate": 1500,
+        "a_max_bitrate": 32,
+        "address": "127.0.0.1",
+        "v_port": 12345,
+        "v_srtp_key": "synthetic",
+        "v_ssrc": 12345,
+    }
+    with (
+        patch.object(accessory, "_async_get_hksv_source", side_effect=acquire),
+        patch("homeassistant.components.homekit.type_cameras.HAFFmpeg") as factory,
+    ):
+        assert not await accessory.start_stream(
+            {"id": "privacy", "stream_idx": 0}, selection
+        )
+        shared.close.assert_awaited_once()
+        factory.assert_not_called()
+
+
+async def test_shared_snapshot_checks_privacy_after_decode(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """Do not return a frame if privacy changes while a keyframe is decoded."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    status = SimpleNamespace(camera_active=True)
+    status.snapshot_allowed = lambda _reason: status.camera_active
+    accessory._hksv = status
+
+    async def image(_width, _height):
+        status.camera_active = False
+        return b"frame"
+
+    shared = SimpleNamespace(image=image, close=AsyncMock())
+    with (
+        patch.object(
+            accessory, "_async_get_hksv_source", AsyncMock(return_value=shared)
+        ),
+        pytest.raises(HAPStatusError),
+    ):
+        await accessory.async_get_snapshot({"image-width": 640, "image-height": 360})
+    shared.close.assert_awaited_once()
+
+
+async def test_live_backpressure_stops_only_live_pipe(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A stalled live consumer releases its pipe without closing another lease."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    waiting = asyncio.Event()
+    writer = SimpleNamespace(
+        write=MagicMock(),
+        drain=AsyncMock(side_effect=waiting.wait),
+        close=MagicMock(),
+    )
+    process = SimpleNamespace(stdin=writer)
+
+    async def parts():
+        yield b"bounded part"
+
+    shared = SimpleNamespace(live_parts=parts, close=AsyncMock())
+    async with asyncio.timeout(7):
+        await accessory._feed_shared_live(SimpleNamespace(process=process), shared)
+    writer.write.assert_called_once_with(b"bounded part")
+    writer.close.assert_called_once()
+    shared.close.assert_not_awaited()
+
+
+async def test_live_stop_closes_pipe_and_waits_for_process(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A real child reading stdin exits when its shared input lease is released."""
+    import sys  # noqa: PLC0415
+
+    from homeassistant.components.homekit.type_cameras import (  # noqa: PLC0415
+        FFMPEG_INPUT_TASK,
+        FFMPEG_SHARED,
+    )
+
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.buffer.read()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    waiting = asyncio.Event()
+
+    async def parts():
+        yield b"media"
+        await waiting.wait()
+
+    shared = SimpleNamespace(live_parts=parts, close=AsyncMock())
+    stream = SimpleNamespace(process=process)
+    feeder = asyncio.create_task(accessory._feed_shared_live(stream, shared))
+    session = {
+        "id": "stopping",
+        "stream": stream,
+        FFMPEG_INPUT_TASK: feeder,
+        FFMPEG_SHARED: shared,
+    }
+    accessory.sessions["stopping"] = session
+    try:
+        await asyncio.sleep(0.1)
+        async with asyncio.timeout(5):
+            await accessory.stop_stream(session)
+        assert process.returncode == 0
+        shared.close.assert_awaited_once()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        accessory.sessions.clear()
+
+
+async def test_live_exit_releases_shared_source_and_audio_proxy(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """An unexpectedly exited encoder releases its shared lease and audio proxy."""
+    from homeassistant.components.homekit.type_cameras import (  # noqa: PLC0415
+        AUDIO_PROXY,
+        FFMPEG_SHARED,
+    )
+
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    shared = SimpleNamespace(close=AsyncMock())
+    proxy = SimpleNamespace(async_stop=AsyncMock())
+    session = {
+        "id": "ended",
+        "stream_idx": 0,
+        FFMPEG_PID: 12345,
+        "stream": SimpleNamespace(process=SimpleNamespace(returncode=1)),
+        FFMPEG_SHARED: shared,
+        AUDIO_PROXY: proxy,
+    }
+    accessory.sessions["ended"] = session
+    with (
+        patch(
+            "homeassistant.components.homekit.type_cameras.pid_is_alive",
+            return_value=False,
+        ),
+        patch.object(accessory, "set_streaming_available"),
+    ):
+        assert not await accessory._async_ffmpeg_watch("ended")
+    shared.close.assert_awaited_once()
+    proxy.async_stop.assert_awaited_once()
+    accessory.sessions.clear()
+
+
+async def test_snapshot_privacy_change_during_release(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """No frame is returned if privacy is disabled during provider cleanup."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    status = SimpleNamespace(camera_active=True)
+    status.snapshot_allowed = lambda _reason: status.camera_active
+    accessory._hksv = status
+
+    async def close():
+        await asyncio.sleep(0)
+        status.camera_active = False
+
+    shared = SimpleNamespace(image=AsyncMock(return_value=b"frame"), close=close)
+    with (
+        patch.object(
+            accessory, "_async_get_hksv_source", AsyncMock(return_value=shared)
+        ),
+        pytest.raises(HAPStatusError),
+    ):
+        await accessory.async_get_snapshot({"image-width": 640, "image-height": 360})
+
+
+async def test_snapshot_without_keyframe_times_out_and_releases_source(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """An unavailable keyframe is bounded and its stream lease is released."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    accessory._hksv = SimpleNamespace(snapshot_allowed=lambda _reason: True)
+
+    async def never(*_args):
+        await asyncio.Event().wait()
+
+    shared = SimpleNamespace(image=AsyncMock(side_effect=never), close=AsyncMock())
+    with (
+        patch("homeassistant.components.homekit.type_cameras.SNAPSHOT_TIMEOUT", 0.01),
+        patch.object(
+            accessory, "_async_get_hksv_source", AsyncMock(return_value=shared)
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        await accessory.async_get_snapshot({"image-width": 640, "image-height": 360})
+    shared.close.assert_awaited_once()
+
+
+async def test_snapshot_source_acquisition_is_bounded(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A source that never opens cannot hold a snapshot request indefinitely."""
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    accessory._hksv = SimpleNamespace(snapshot_allowed=lambda _reason: True)
+
+    async def never(*_args):
+        await asyncio.Event().wait()
+
+    with (
+        patch("homeassistant.components.homekit.type_cameras.SNAPSHOT_TIMEOUT", 0.01),
+        patch.object(accessory, "_async_get_hksv_source", AsyncMock(side_effect=never)),
+        pytest.raises(TimeoutError),
+    ):
+        await accessory.async_get_snapshot({"image-width": 640, "image-height": 360})
+
+
+async def test_default_encoder_outputs_negotiated_size_profile_and_level(
+    hass: HomeAssistant, run_driver
+) -> None:
+    """A real 4 MP input is encoded to HomeKit's negotiated 720p format."""
+    from io import BytesIO  # noqa: PLC0415
+    import shlex  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    import av  # noqa: PLC0415
+
+    binary = shutil.which("ffmpeg")
+    if not binary:
+        pytest.skip("ffmpeg unavailable")
+    await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
+    hass.states.async_set("camera.test", "idle")
+    accessory = Camera(hass, run_driver, "Camera", "camera.test", 2, {})
+    selection = {
+        "v_profile_id": b"\x02",
+        "v_level": b"\x02",
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+    }
+    _, codec, options, hardware = await accessory._live_video_parameters(selection)
+    assert codec == "libx264"
+    assert hardware is None
+    process = await asyncio.create_subprocess_exec(
+        binary,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:s=2560x1920:r=15",
+        "-frames:v",
+        "2",
+        "-c:v",
+        codec,
+        *shlex.split(options),
+        "-r",
+        "15",
+        "-movflags",
+        "frag_keyframe+empty_moov",
+        "-f",
+        "mp4",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    async with asyncio.timeout(15):
+        output, stderr = await process.communicate()
+    assert process.returncode == 0, stderr.decode(errors="replace")
+    with av.open(BytesIO(output), format="mp4") as container:
+        video = container.streams.video[0]
+        assert (video.width, video.height) == (1280, 720)
+        assert video.codec_context.profile == "High"
+        assert video.codec_context.extradata[3] == 40
+        assert video.average_rate == 15
+        assert len(list(container.decode(video=0))) == 2
