@@ -581,6 +581,11 @@ class Camera(HomeDoorbellAccessory, PyhapCamera):  # type: ignore[misc]
                 "address_or_protocol",
                 (
                     b"address family not supported",
+                    b"address already in use",
+                    b"bind failed",
+                    b"network is unreachable",
+                    b"no route to host",
+                    b"getaddrinfo",
                     b"invalid ipv6",
                     b"invalid argument",
                     b"protocol not found",

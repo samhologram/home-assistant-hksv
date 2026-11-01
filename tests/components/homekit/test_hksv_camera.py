@@ -205,8 +205,23 @@ async def test_explicit_stream_source_disables_hksv_only(
     assert "Secure Video is unavailable with an explicit stream source" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (b"Connection refused", "connection_refused"),
+        (b"Address already in use", "address_or_protocol"),
+        (b"Bind failed", "address_or_protocol"),
+        (b"Network is unreachable", "address_or_protocol"),
+        (b"No route to host", "address_or_protocol"),
+        (b"getaddrinfo", "address_or_protocol"),
+    ],
+)
 async def test_live_failure_reports_only_safe_categories(
-    hass: HomeAssistant, run_driver, caplog: pytest.LogCaptureFixture
+    hass: HomeAssistant,
+    run_driver,
+    caplog: pytest.LogCaptureFixture,
+    error: bytes,
+    expected: str,
 ) -> None:
     """Retain bounded failure categories without logging URLs or SRTP secrets."""
     await async_setup_component(hass, ffmpeg.DOMAIN, {ffmpeg.DOMAIN: {}})
@@ -220,12 +235,11 @@ async def test_live_failure_reports_only_safe_categories(
     }
     reader = asyncio.StreamReader()
     reader.feed_data(
-        b"x" * 4090
-        + b"Connection refused rtsp://user:secret@host/stream srtp-key-secret"
+        b"x" * 4090 + error + b" rtsp://user:secret@host/stream srtp-key-secret"
     )
     reader.feed_eof()
     await accessory._async_log_stderr_stream(reader, session)
-    assert session["ffmpeg_diagnostics"] == {"connection_refused"}
+    assert session["ffmpeg_diagnostics"] == {expected}
     accessory.sessions["diagnostic"] = session
     with (
         patch(
@@ -235,7 +249,7 @@ async def test_live_failure_reports_only_safe_categories(
         patch.object(accessory, "set_streaming_available"),
     ):
         assert not await accessory._async_ffmpeg_watch("diagnostic")
-    assert "connection_refused" in caplog.text
+    assert expected in caplog.text
     assert "secret" not in caplog.text
     assert "rtsp://" not in caplog.text
     accessory.sessions.clear()
