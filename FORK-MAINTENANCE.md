@@ -14,6 +14,12 @@ This is a personal-fork operations guide. Keep it and the added personal
 
 ## Updating while retaining HKSV
 
+For this HKSV work, the owner has requested that each pushed PR code fix also
+be ported, validated and deployed on the maintained instance, with backup and
+rollback. Make the corrected stable version available promptly for owner
+testing, then finish broader regression checks. This standing instruction does
+not authorize unrelated upgrades or package publication.
+
 1. Read the personal Nodum Homelab notes and verify the actual running host, image, source refs and configuration. vmp4 is a coordination/documentation host; do not assume it runs HA.
 2. Require a clean checkout. Inspect `git remote -v`, fetch `origin` and `upstream`, and review incoming changes. A plain `git pull` follows the configured personal fork branch, not necessarily original HA.
 3. Create an isolated worktree from the appropriate maintained HKSV branch. Merge the selected upstream stable tag for production, or upstream `dev` for contribution work. Keep published PR history: add commits or merge upstream instead of rewriting it.

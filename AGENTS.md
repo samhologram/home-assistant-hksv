@@ -61,3 +61,4 @@ a user without their review.
 - Keep this section and that operations guide on the personal maintenance branch only. Do not include them in upstream PRs.
 - Preserve HKSV when integrating upstream; validate HA and HAP together in isolated worktrees before any deployment.
 - Do not replace the working fork with a release lacking the required APIs, enable fork CI/CD, or publish a package automatically.
+- Standing owner instruction for HKSV PR code fixes: also port, validate and deploy them on the maintained stable instance with backup and rollback; make owner testing available promptly, then finish broader regression checks.
