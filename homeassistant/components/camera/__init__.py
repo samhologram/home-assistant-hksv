@@ -402,6 +402,8 @@ class Camera(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
         self.async_update_token()
         self._create_stream_lock: asyncio.Lock | None = None
         self._webrtc_provider: CameraWebRTCProvider | None = None
+        self._stream_managed_source: str | None = None
+        self._stream_managed_instance: Stream | None = None
         self._supports_native_async_webrtc = (
             type(self).async_handle_async_webrtc_offer
             != Camera.async_handle_async_webrtc_offer
@@ -478,7 +480,7 @@ class Camera(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
         async with self._create_stream_lock:
             if not self.stream:
                 async with asyncio.timeout(CAMERA_STREAM_SOURCE_TIMEOUT):
-                    source = await self.stream_source()
+                    source = await self._async_resolve_stream_source()
                 if not source:
                     return None
                 self.stream = create_stream(
@@ -490,8 +492,44 @@ class Camera(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
                     ),
                     stream_label=self.entity_id,
                 )
+                self._stream_managed_instance = self.stream
+                self._stream_managed_source = source
                 self.stream.set_update_callback(self.async_write_ha_state)
             return self.stream
+
+    async def _async_resolve_stream_source(self) -> str | None:
+        """Resolve a shared source, falling back to the camera source."""
+        source = None
+        if self._webrtc_provider:
+            try:
+                source = await self._webrtc_provider.async_get_stream_source(self)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Unable to resolve shared stream for %s", self.entity_id
+                )
+        return source or await self.stream_source()
+
+    async def async_refresh_stream_source(self) -> None:
+        """Update an existing camera stream without replacing its outputs."""
+        if not self._create_stream_lock:
+            return
+        async with self._create_stream_lock:
+            if not self.stream:
+                return
+            if (
+                self.stream is not self._stream_managed_instance
+                or self.stream.source != self._stream_managed_source
+            ):
+                return
+            try:
+                async with asyncio.timeout(CAMERA_STREAM_SOURCE_TIMEOUT):
+                    source = await self._async_resolve_stream_source()
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("Unable to refresh stream for %s", self.entity_id)
+                return
+            if source and source != self.stream.source:
+                self.stream.update_source(source)
+                self._stream_managed_source = source
 
     async def stream_source(self) -> str | None:
         """Return the source of the stream.
@@ -685,6 +723,7 @@ class Camera(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
             )
 
         self._webrtc_provider = new_provider
+        await self.async_refresh_stream_source()
         self._invalidate_camera_capabilities_cache()
         if write_state:
             self.async_write_ha_state()
@@ -964,4 +1003,5 @@ async def websocket_update_prefs(
                 "notifying WebRTC provider of preferences update for",
                 entity_id,
             )
+            await camera.async_refresh_stream_source()
         connection.send_result(msg["id"], entity_prefs)
