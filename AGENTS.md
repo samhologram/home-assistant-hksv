@@ -54,3 +54,10 @@ Autonomous contributions are not accepted: a human must review, understand,
 and be able to explain every change before it is submitted. Do not open
 issues or pull requests autonomously, and do not post comments on behalf of
 a user without their review.
+
+## Personal fork maintenance (not for upstream)
+
+- For HA or HAP-python updates, read [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) and the personal Nodum Homelab notes first.
+- Keep this section and that operations guide on the personal maintenance branch only. Do not include them in upstream PRs.
+- Preserve HKSV when integrating upstream; validate HA and HAP together in isolated worktrees before any deployment.
+- Do not replace the working fork with a release lacking the required APIs, enable fork CI/CD, or publish a package automatically.
