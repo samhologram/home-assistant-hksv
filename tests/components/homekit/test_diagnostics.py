@@ -122,7 +122,7 @@ async def test_config_entry_running(
                             {
                                 "format": "string",
                                 "iid": 9,
-                                "perms": ["pr", "ev"],
+                                "perms": ["pr"],
                                 "type": "37",
                                 "value": "01.01.00",
                             }
@@ -234,7 +234,7 @@ async def test_config_entry_accessory(
                             {
                                 "format": "string",
                                 "iid": 9,
-                                "perms": ["pr", "ev"],
+                                "perms": ["pr"],
                                 "type": "37",
                                 "value": "01.01.00",
                             }
@@ -411,7 +411,7 @@ async def test_config_entry_with_trigger_accessory(
                             {
                                 "format": "string",
                                 "iid": 9,
-                                "perms": ["pr", "ev"],
+                                "perms": ["pr"],
                                 "type": "37",
                                 "value": "01.01.00",
                             }
